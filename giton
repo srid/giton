@@ -183,6 +183,12 @@ if [[ "$REMOTE" == true ]]; then
   }
   trap cleanup EXIT
 
+  # Ensure SSH ControlMaster socket directory exists
+  SSH_CONTROL_PATH=$(ssh -G "$HOST" 2>/dev/null | awk '/^controlpath / {print $2}')
+  if [[ -n "$SSH_CONTROL_PATH" ]]; then
+    mkdir -p "$(dirname "$SSH_CONTROL_PATH")"
+  fi
+
   log "Copying repo to ${BOLD}${HOST}${RESET}:${REMOTE_DIR}..."
   git archive --format=tar HEAD | ssh "$HOST" "mkdir -p '$REMOTE_DIR' && tar -C '$REMOTE_DIR' -x"
 
