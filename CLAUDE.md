@@ -1,20 +1,14 @@
-# giton
+# Project
 
-Local CI tool. Runs commands on specific Nix platforms and posts GitHub commit statuses.
+Single bash script (`giton`) packaged as a Nix flake via `writeShellApplication`. Runtime deps: git, gh, nix.
 
-## Usage
-
-```
-giton --system <nix-system> --name <check-name> -- <command...>
-```
-
-## Dev
+# Dev
 
 - Build: `nix build`
-- Run: `nix run . -- --system x86_64-linux --name test -- echo hello`
+- Test: `nix run . -- --system $(nix eval --raw --impure --expr builtins.currentSystem) --name test -- echo hello`
 
-## Architecture
+# Key details
 
-Single bash script packaged via `writeShellApplication`. Runtime deps: git, gh, nix.
-
-GitHub status context format: `giton/<system>/<name>`
+- GitHub status context format: `giton/<system>/<name>`
+- Phase 2 (remote SSH execution) is not yet implemented
+- `flake.nix` uses flake-parts
