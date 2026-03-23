@@ -184,7 +184,9 @@ save_host() {
   fi
 }
 
-# Run a command with stdout/stderr prefixed by LINE_PREFIX
+# Run a command with stdout/stderr prefixed by LINE_PREFIX.
+# Sets EXIT_CODE (global) to the command's exit status.
+# Uses SOH (\x01) as sed delimiter to avoid clashing with / in context names.
 run_prefixed() {
   EXIT_CODE=0
   { "$@" 2>&1 || EXIT_CODE=$?; } > >(sed -u $'s\x01^\x01'"${LINE_PREFIX}"$'\x01' >&2)
