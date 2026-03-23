@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: giton --system <nix-system> --name <check-name> -- <command...>"
+  echo ""
+  echo "Run a command on a specific Nix platform and post GitHub commit status."
+  echo ""
+  echo "Options:"
+  echo "  --system    Nix system string (e.g. x86_64-linux, aarch64-darwin)"
+  echo "  --name      Check name (used in GitHub status context)"
+  echo "  --          Separator before the command to run"
+  exit 1
+}
+
+# Parse arguments
+SYSTEM=""
+NAME=""
+CMD=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --system)
+      SYSTEM="$2"
+      shift 2
+      ;;
+    --name)
+      NAME="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      CMD=("$@")
+      break
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "Error: Unknown option '$1'"
+      usage
+      ;;
+  esac
+done
+
+if [[ -z "$SYSTEM" || -z "$NAME" || ${#CMD[@]} -eq 0 ]]; then
+  echo "Error: --system, --name, and a command after -- are all required."
+  usage
+fi
+
+# Ensure we're in a git repo
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  echo "Error: Not inside a git repository."
+  exit 1
+fi
+
+# Ensure working tree is clean
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "Error: Working tree is dirty. Commit or stash changes first."
+  exit 1
+fi
+
+SHA=$(git rev-parse HEAD)
+CONTEXT="giton/${SYSTEM}/${NAME}"
+
+# Get owner/repo from gh
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+if [[ -z "$REPO" ]]; then
+  echo "Error: Could not determine GitHub repository. Is 'gh' authenticated?"
+  exit 1
+fi
+
+echo "==> giton: ${CONTEXT}"
+echo "    repo:   ${REPO}"
+echo "    commit: ${SHA:0:12}"
+echo "    cmd:    ${CMD[*]}"
+
+# Post pending status
+post_status() {
+  local state="$1"
+  local description="${2:-}"
+  gh api "repos/${REPO}/statuses/${SHA}" \
+    -f state="$state" \
+    -f context="$CONTEXT" \
+    -f description="$description" \
+    --silent
+}
+
+echo "==> Posting pending status..."
+post_status "pending" "Running: ${CMD[*]}"
+
+# Determine current system
+CURRENT_SYSTEM=$(nix eval --raw --impure --expr builtins.currentSystem)
+
+if [[ "$CURRENT_SYSTEM" != "$SYSTEM" ]]; then
+  echo "Error: Remote execution not yet implemented."
+  echo "       Current system: ${CURRENT_SYSTEM}"
+  echo "       Requested:      ${SYSTEM}"
+  post_status "error" "Remote execution not yet implemented"
+  exit 1
+fi
+
+# Local execution: git archive to tmpdir
+TMPDIR=$(mktemp -d "/tmp/giton-${SHA:0:12}-XXXXXX")
+cleanup() {
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+echo "==> Extracting repo to ${TMPDIR}..."
+git archive --format=tar HEAD | tar -C "$TMPDIR" -x
+
+echo "==> Running: ${CMD[*]}"
+EXIT_CODE=0
+(cd "$TMPDIR" && "${CMD[@]}") || EXIT_CODE=$?
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  echo "==> Command succeeded."
+  post_status "success" "Passed: ${CMD[*]}"
+else
+  echo "==> Command failed (exit code: ${EXIT_CODE})."
+  post_status "failure" "Failed (exit ${EXIT_CODE}): ${CMD[*]}"
+fi
+
+exit $EXIT_CODE
