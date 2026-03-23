@@ -186,7 +186,7 @@ if [[ -n "$CONFIG_FILE" ]]; then
 
   # Build process-compose config via jq.
   # Each step × system becomes a process; dependencies expand per-system.
-  jq --arg sha "$SHA" --arg bin "$0" '
+  jq --arg sha "$SHA" --arg bin "$0" --arg wd "$PWD" '
     .steps as $steps |
     [ $steps | to_entries[] | .key as $step | .value as $cfg |
       ($cfg.systems // [null]) as $systems |
@@ -208,7 +208,8 @@ if [[ -n "$CONFIG_FILE" ]]; then
         ] | from_entries | if length > 0 then . else null end
       ) as $depends |
       { key: $name, value: (
-        { command: $command }
+        { command: $command, working_dir: $wd,
+          availability: { restart: "exit_on_failure" } }
         + if $depends then { depends_on: $depends } else {} end
       )}
     ] | from_entries |
