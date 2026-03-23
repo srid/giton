@@ -34,7 +34,7 @@ Define steps with systems, commands, and dependencies in a JSON config:
 }
 ```
 
-Steps run in parallel across systems. Dependencies are resolved per-system — `e2e/x86_64-linux` waits for `nix/x86_64-linux` but not `nix/aarch64-darwin`. Orchestration is handled by [process-compose](https://github.com/F1bonacc1/process-compose).
+Steps run in parallel across systems. Dependencies are resolved per-system — `e2e/x86_64-linux` waits for `nix/x86_64-linux` but not `nix/aarch64-darwin`. If a step fails, its dependents won't start, but independent steps continue running. Orchestration is handled by [process-compose](https://github.com/F1bonacc1/process-compose).
 
 ### Examples
 
