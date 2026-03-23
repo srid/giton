@@ -104,31 +104,91 @@ post_status() {
 echo "==> Posting pending status..."
 post_status "pending" "Running: ${CMD[*]}"
 
-# Check system match if --system was specified
+# Determine if we need remote execution
+REMOTE=false
 if [[ "$SYSTEM_EXPLICIT" == true ]]; then
   CURRENT_SYSTEM=$(nix eval --raw --impure --expr builtins.currentSystem)
   if [[ "$CURRENT_SYSTEM" != "$SYSTEM" ]]; then
-    echo "Error: Remote execution not yet implemented."
-    echo "       Current system: ${CURRENT_SYSTEM}"
-    echo "       Requested:      ${SYSTEM}"
-    post_status "error" "Remote execution not yet implemented"
-    exit 1
+    REMOTE=true
   fi
 fi
 
-# Local execution: git archive to tmpdir
-TMPDIR=$(mktemp -d "/tmp/giton-${SHA:0:12}-XXXXXX")
-cleanup() {
-  rm -rf "$TMPDIR"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/giton"
+HOSTS_FILE="${CONFIG_DIR}/hosts.json"
+
+# Look up or prompt for remote hostname
+get_remote_host() {
+  local system="$1"
+  local host=""
+
+  # Try reading from persisted hosts
+  if [[ -f "$HOSTS_FILE" ]]; then
+    host=$(jq -r --arg s "$system" '.[$s] // empty' "$HOSTS_FILE" 2>/dev/null || true)
+  fi
+
+  if [[ -n "$host" ]]; then
+    echo "==> Using saved host for ${system}: ${host}" >&2
+    read -r -p "    Press Enter to use '${host}', or type a new hostname: " override </dev/tty
+    if [[ -n "$override" ]]; then
+      host="$override"
+      save_host "$system" "$host"
+    fi
+  else
+    read -r -p "==> Enter hostname for ${system}: " host </dev/tty
+    if [[ -z "$host" ]]; then
+      echo "Error: No hostname provided."
+      exit 1
+    fi
+    save_host "$system" "$host"
+  fi
+
+  echo "$host"
 }
-trap cleanup EXIT
 
-echo "==> Extracting repo to ${TMPDIR}..."
-git archive --format=tar HEAD | tar -C "$TMPDIR" -x
+save_host() {
+  local system="$1"
+  local host="$2"
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$HOSTS_FILE" ]]; then
+    jq --arg s "$system" --arg h "$host" '.[$s] = $h' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp"
+    mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+  else
+    jq -n --arg s "$system" --arg h "$host" '{($s): $h}' > "$HOSTS_FILE"
+  fi
+}
 
-echo "==> Running: ${CMD[*]}"
-EXIT_CODE=0
-(cd "$TMPDIR" && "${CMD[@]}") || EXIT_CODE=$?
+if [[ "$REMOTE" == true ]]; then
+  # Remote execution
+  HOST=$(get_remote_host "$SYSTEM")
+  REMOTE_DIR="/tmp/giton-${SHA:0:12}"
+
+  cleanup() {
+    echo "==> Cleaning up remote temp dir..."
+    ssh "$HOST" "rm -rf '$REMOTE_DIR'" 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  echo "==> Copying repo to ${HOST}:${REMOTE_DIR}..."
+  git archive --format=tar HEAD | ssh "$HOST" "mkdir -p '$REMOTE_DIR' && tar -C '$REMOTE_DIR' -x"
+
+  echo "==> Running on ${HOST}: ${CMD[*]}"
+  EXIT_CODE=0
+  ssh "$HOST" "cd '$REMOTE_DIR' && ${CMD[*]}" || EXIT_CODE=$?
+else
+  # Local execution: git archive to tmpdir
+  TMPDIR=$(mktemp -d "/tmp/giton-${SHA:0:12}-XXXXXX")
+  cleanup() {
+    rm -rf "$TMPDIR"
+  }
+  trap cleanup EXIT
+
+  echo "==> Extracting repo to ${TMPDIR}..."
+  git archive --format=tar HEAD | tar -C "$TMPDIR" -x
+
+  echo "==> Running: ${CMD[*]}"
+  EXIT_CODE=0
+  (cd "$TMPDIR" && "${CMD[@]}") || EXIT_CODE=$?
+fi
 
 if [[ $EXIT_CODE -eq 0 ]]; then
   echo "==> Command succeeded."

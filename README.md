@@ -29,7 +29,7 @@ nix run github:srid/giton -- -s x86_64-linux -n build -- nix build
 
 Status context: `giton/<name>` without `--system`, `giton/<name>/<system>` with it.
 
-If `--system` is specified and doesn't match the current host, remote execution via SSH is planned but not yet implemented.
+When `--system` doesn't match the current host, giton prompts for an SSH hostname, copies the repo via `git archive | ssh`, and runs the command remotely. Hostnames are saved to `$XDG_CONFIG_HOME/giton/hosts.json` for reuse.
 
 ## Install
 
