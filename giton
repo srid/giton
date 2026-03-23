@@ -43,6 +43,7 @@ usage() {
   echo ""
   echo "Common options:"
   echo "  --sha           Pin to a specific commit SHA (skips clean-tree check)"
+  echo "  --tui           Enable process-compose TUI (multi-step mode only)"
   echo ""
   echo "Status context: giton/<name> (no --system) or giton/<name>/<system> (with --system)"
   exit 1
@@ -55,6 +56,7 @@ NAME=""
 CMD=()
 SHA_PIN=""
 CONFIG_FILE=""
+TUI=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,6 +76,10 @@ while [[ $# -gt 0 ]]; do
     -f|--file)
       CONFIG_FILE="$2"
       shift 2
+      ;;
+    --tui)
+      TUI=true
+      shift
       ;;
     --)
       shift
@@ -154,10 +160,7 @@ if [[ -n "$CONFIG_FILE" ]]; then
     { version: "0.5", log_level: "fatal", processes: . }
   ' "$CONFIG_FILE" > "$PC_FILE"
 
-  info "Generated process-compose config:"
-  cat "$PC_FILE" >&2
-
-  exec process-compose up --tui=false --config "$PC_FILE"
+  exec process-compose up --tui="$TUI" --config "$PC_FILE"
 fi
 
 # ─── Single-step mode ────────────────────────────────────────────────────────
