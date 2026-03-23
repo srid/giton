@@ -112,6 +112,51 @@ else
   SHA=$(git rev-parse HEAD)
 fi
 
+# ─── Host configuration ───────────────────────────────────────────────────────
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/giton"
+HOSTS_FILE="${CONFIG_DIR}/hosts.json"
+
+save_host() {
+  local system="$1"
+  local host="$2"
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$HOSTS_FILE" ]]; then
+    jq --arg s "$system" --arg h "$host" '.[$s] = $h' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp"
+    mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+  else
+    jq -n --arg s "$system" --arg h "$host" '{($s): $h}' > "$HOSTS_FILE"
+  fi
+}
+
+# Look up or prompt for remote hostname
+get_remote_host() {
+  local system="$1"
+  local host=""
+
+  # Try reading from persisted hosts
+  if [[ -f "$HOSTS_FILE" ]]; then
+    host=$(jq -r --arg s "$system" '.[$s] // empty' "$HOSTS_FILE" 2>/dev/null || true)
+  fi
+
+  if [[ -n "$host" ]]; then
+    log "Using saved host for ${system}: ${BOLD}${host}${RESET}"
+  else
+    # Flush any pending terminal responses before reading
+    read -r -d '' -t 0.1 _discard </dev/tty 2>/dev/null || true
+    echo -n "==> Enter hostname for ${system}: " >&2
+    read -r host </dev/tty
+    host=$(echo "$host" | tr -cd '[:alnum:]._-')
+    if [[ -z "$host" ]]; then
+      err "No hostname provided."
+      exit 1
+    fi
+    save_host "$system" "$host"
+  fi
+
+  echo "$host"
+}
+
 # ─── Multi-step mode ─────────────────────────────────────────────────────────
 
 if [[ -n "$CONFIG_FILE" ]]; then
@@ -121,6 +166,18 @@ if [[ -n "$CONFIG_FILE" ]]; then
   fi
 
   log "Multi-step mode: ${BOLD}${CONFIG_FILE}${RESET}  ${DIM}SHA=${SHA:0:12}${RESET}"
+
+  # Resolve remote hosts upfront (process-compose subprocesses can't prompt)
+  CURRENT_SYSTEM=$(nix eval --raw --impure --expr builtins.currentSystem)
+  REMOTE_SYSTEMS=$(jq -r '[.steps[].systems // [] | .[]] | unique[]' "$CONFIG_FILE")
+  for sys in $REMOTE_SYSTEMS; do
+    if [[ "$sys" != "$CURRENT_SYSTEM" ]]; then
+      HOST=$(get_remote_host "$sys")
+      # Warm SSH connection (triggers password/key prompts while we have TTY)
+      log "Warming SSH connection to ${BOLD}${HOST}${RESET} (${sys})..."
+      ssh "$HOST" echo ok >/dev/null
+    fi
+  done
 
   # Generate process-compose config (JSON, which is valid YAML) from giton config
   PC_FILE=$(mktemp /tmp/giton-pc-XXXXXX.json)
@@ -214,49 +271,6 @@ if [[ "$SYSTEM_EXPLICIT" == true ]]; then
   fi
 fi
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/giton"
-HOSTS_FILE="${CONFIG_DIR}/hosts.json"
-
-# Look up or prompt for remote hostname
-get_remote_host() {
-  local system="$1"
-  local host=""
-
-  # Try reading from persisted hosts
-  if [[ -f "$HOSTS_FILE" ]]; then
-    host=$(jq -r --arg s "$system" '.[$s] // empty' "$HOSTS_FILE" 2>/dev/null || true)
-  fi
-
-  if [[ -n "$host" ]]; then
-    log "Using saved host for ${system}: ${BOLD}${host}${RESET}"
-  else
-    # Flush any pending terminal responses before reading
-    read -r -d '' -t 0.1 _discard </dev/tty 2>/dev/null || true
-    echo -n "==> Enter hostname for ${system}: " >&2
-    read -r host </dev/tty
-    host=$(echo "$host" | tr -cd '[:alnum:]._-')
-    if [[ -z "$host" ]]; then
-      err "No hostname provided."
-      exit 1
-    fi
-    save_host "$system" "$host"
-  fi
-
-  echo "$host"
-}
-
-save_host() {
-  local system="$1"
-  local host="$2"
-  mkdir -p "$CONFIG_DIR"
-  if [[ -f "$HOSTS_FILE" ]]; then
-    jq --arg s "$system" --arg h "$host" '.[$s] = $h' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp"
-    mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
-  else
-    jq -n --arg s "$system" --arg h "$host" '{($s): $h}' > "$HOSTS_FILE"
-  fi
-}
-
 run_cmd() {
   EXIT_CODE=0
   "$@" || EXIT_CODE=$?
@@ -282,7 +296,7 @@ if [[ "$REMOTE" == true ]]; then
   fi
 
   log "Copying repo to ${BOLD}${HOST}${RESET}..."
-  git archive --format=tar "$SHA" | ssh "$HOST" "mkdir -p '$REMOTE_DIR' && tar -C '$REMOTE_DIR' -x"
+  git archive --format=tar "$SHA" | ssh "$HOST" "mkdir -p '$REMOTE_DIR' && tar -C '$REMOTE_DIR' -x && chmod -R u+w '$REMOTE_DIR'"
 
   run_cmd ssh "$HOST" "cd '$REMOTE_DIR' && ${CMD[*]}"
 else
@@ -295,6 +309,7 @@ else
 
   log "Extracting repo..."
   git archive --format=tar "$SHA" | tar -C "$TMPDIR" -x
+  chmod -R u+w "$TMPDIR"
 
   run_cmd bash -c "cd '$TMPDIR' && $(printf '%q ' "${CMD[@]}")"
 fi
