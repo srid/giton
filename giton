@@ -118,84 +118,40 @@ if [[ -n "$CONFIG_FILE" ]]; then
 
   log "Multi-step mode: ${BOLD}${CONFIG_FILE}${RESET}  ${DIM}SHA=${SHA:0:12}${RESET}"
 
-  # Generate process-compose YAML from giton config JSON
-  PC_FILE=$(mktemp /tmp/giton-pc-XXXXXX.yml)
+  # Generate process-compose config (JSON, which is valid YAML) from giton config
+  PC_FILE=$(mktemp /tmp/giton-pc-XXXXXX.json)
   cleanup_pc() { rm -f "$PC_FILE"; }
   trap cleanup_pc EXIT
 
-  GITON_BIN="$0"
-
-  # Build process-compose config via jq
-  jq -r --arg sha "$SHA" --arg bin "$GITON_BIN" '
-    # Collect all step names and their systems for dependency resolution
+  # Build process-compose config via jq.
+  # Each step × system becomes a process; dependencies expand per-system.
+  jq --arg sha "$SHA" --arg bin "$0" '
     .steps as $steps |
-
-    # For each step, expand into per-system processes
     [ $steps | to_entries[] | .key as $step | .value as $cfg |
-      ($cfg.systems // []) as $systems |
+      ($cfg.systems // [null]) as $systems |
       ($cfg.depends_on // []) as $deps |
-      ($cfg.command) as $cmd |
-
-      # If no systems specified, create a single process without system suffix
-      if ($systems | length) == 0 then
-        [{
-          name: $step,
-          command: ([$bin, "--sha", $sha, "-n", $step, "--", $cmd] | join(" ")),
-          depends_on: (
-            if ($deps | length) > 0 then
-              [ $deps[] as $dep |
-                if ($steps[$dep].systems // [] | length) == 0 then
-                  { key: $dep, value: { condition: "process_completed_successfully" } }
-                else
-                  empty
-                end
-              ] | from_entries
-            else
-              null
-            end
-          )
-        }]
-      else
-        [ $systems[] as $sys |
-          {
-            name: ($step + "/" + $sys),
-            command: ([$bin, "--sha", $sha, "-s", $sys, "-n", $step, "--", $cmd] | join(" ")),
-            depends_on: (
-              if ($deps | length) > 0 then
-                [ $deps[] as $dep |
-                  # Only add dependency edge if the dep step includes this system
-                  if ($steps[$dep].systems // [] | index($sys)) then
-                    { key: ($dep + "/" + $sys), value: { condition: "process_completed_successfully" } }
-                  else
-                    empty
-                  end
-                ] | from_entries
-              else
-                null
-              end
-            )
-          }
-        ]
-      end
-    ] | flatten |
-
-    # Convert to process-compose YAML structure
-    "version: \"0.5\"\n" +
-    "log_level: \"fatal\"\n" +
-    "\nprocesses:\n" +
-    (map(
-      "  \"" + .name + "\":\n" +
-      "    command: " + (.command | @json) + "\n" +
-      if .depends_on != null and (.depends_on | length) > 0 then
-        "    depends_on:\n" +
-        ([.depends_on | to_entries[] |
-          "      \"" + .key + "\":\n" +
-          "        condition: " + .value.condition
-        ] | join("\n")) + "\n"
-      else
-        ""
-      end
-    ) | join(""))
+      $systems[] as $sys |
+      ( if $sys then $step + "/" + $sys else $step end ) as $name |
+      ( [$bin, "--sha", $sha]
+        + (if $sys then ["-s", $sys] else [] end)
+        + ["-n", $step, "--", $cfg.command] | join(" ")
+      ) as $command |
+      ( [ $deps[] as $dep |
+          ( if $sys and ($steps[$dep].systems // [] | index($sys))
+            then $dep + "/" + $sys
+            elif ($sys | not) and ($steps[$dep].systems // [] | length) == 0
+            then $dep
+            else empty end
+          ) as $dep_name |
+          { key: $dep_name, value: { condition: "process_completed_successfully" } }
+        ] | from_entries | if length > 0 then . else null end
+      ) as $depends |
+      { key: $name, value: (
+        { command: $command }
+        + if $depends then { depends_on: $depends } else {} end
+      )}
+    ] | from_entries |
+    { version: "0.5", log_level: "fatal", processes: . }
   ' "$CONFIG_FILE" > "$PC_FILE"
 
   info "Generated process-compose config:"
