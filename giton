@@ -238,15 +238,17 @@ if [[ -n "$CONFIG_FILE" ]]; then
   else
     warn "One or more steps failed (exit ${PC_EXIT})"
     info "Logs: ${LOG_DIR}/"
-    # Show log output for failed steps
-    for logfile in "$LOG_DIR"/*.log; do
-      [[ -s "$logfile" ]] || continue
-      grep -q "failed" "$logfile" || continue
-      stepname=$(basename "$logfile" .log)
-      echo "" >&2
-      warn "${BOLD}${stepname}${RESET}:"
-      jq -r '.message' "$logfile" >&2
-    done
+    # In non-TUI mode, show log output for failed steps
+    if [[ "$TUI" == false ]]; then
+      for logfile in "$LOG_DIR"/*.log; do
+        [[ -s "$logfile" ]] || continue
+        grep -q "failed" "$logfile" || continue
+        stepname=$(basename "$logfile" .log)
+        echo "" >&2
+        warn "${BOLD}${stepname}${RESET}:"
+        jq -r '.message' "$logfile" >&2
+      done
+    fi
   fi
   exit $PC_EXIT
 fi
@@ -314,7 +316,7 @@ CMD_START=$SECONDS
 if [[ "$REMOTE" == true ]]; then
   # Remote execution
   HOST=$(get_remote_host "$SYSTEM")
-  REMOTE_DIR="/tmp/giton-${SHA:0:12}"
+  REMOTE_DIR="/tmp/giton-${SHA:0:12}-${NAME}"
 
   cleanup() {
     log "Cleaning up remote temp dir..."
