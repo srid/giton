@@ -145,9 +145,9 @@ get_remote_host() {
   if [[ -n "$host" ]]; then
     log "Using saved host for ${system}: ${BOLD}${host}${RESET}"
   else
-    read -r -p "$(echo -e "${CYAN}${BOLD}==>${RESET} Enter hostname for ${system}: ")" host </dev/tty
-    host="${host%$'\r'}"
-    host="${host// /}"
+    echo -ne "${CYAN}${BOLD}==>${RESET} Enter hostname for ${system}: " >&2
+    read -r host </dev/tty
+    host=$(echo "$host" | tr -cd '[:alnum:]._-')
     if [[ -z "$host" ]]; then
       err "No hostname provided."
       exit 1
