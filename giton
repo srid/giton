@@ -167,12 +167,15 @@ if [[ -n "$CONFIG_FILE" ]]; then
 
   log "Multi-step mode: ${BOLD}${CONFIG_FILE}${RESET}  ${DIM}SHA=${SHA:0:12}${RESET}"
 
-  # Resolve remote hosts upfront (process-compose subprocesses can't prompt)
+  # Resolve remote hosts upfront (process-compose subprocesses can't prompt).
+  # Build system→hostname map for process-compose namespaces.
   CURRENT_SYSTEM=$(nix eval --raw --impure --expr builtins.currentSystem)
+  HOST_MAP=$(jq -n --arg sys "$CURRENT_SYSTEM" --arg host "$(hostname)" '{($sys): $host}')
   REMOTE_SYSTEMS=$(jq -r '[.steps[].systems // [] | .[]] | unique[]' "$CONFIG_FILE")
   for sys in $REMOTE_SYSTEMS; do
     if [[ "$sys" != "$CURRENT_SYSTEM" ]]; then
       HOST=$(get_remote_host "$sys")
+      HOST_MAP=$(echo "$HOST_MAP" | jq --arg sys "$sys" --arg host "$HOST" '. + {($sys): $host}')
       # Warm SSH connection (triggers password/key prompts while we have TTY)
       log "Warming SSH connection to ${BOLD}${HOST}${RESET} (${sys})..."
       ssh "$HOST" echo ok >/dev/null
@@ -186,7 +189,7 @@ if [[ -n "$CONFIG_FILE" ]]; then
 
   # Build process-compose config via jq.
   # Each step × system becomes a process; dependencies expand per-system.
-  jq --arg sha "$SHA" --arg bin "$0" --arg wd "$PWD" '
+  jq --arg sha "$SHA" --arg bin "$0" --arg wd "$PWD" --argjson hosts "$HOST_MAP" '
     .steps as $steps |
     [ $steps | to_entries[] | .key as $step | .value as $cfg |
       ($cfg.systems // [null]) as $systems |
@@ -209,8 +212,10 @@ if [[ -n "$CONFIG_FILE" ]]; then
       ) as $depends |
       { key: $name, value: (
         { command: $command, working_dir: $wd,
+          namespace: (if $sys then $hosts[$sys] // $sys else null end),
           availability: { restart: "exit_on_failure" } }
         + if $depends then { depends_on: $depends } else {} end
+        | del(.namespace | nulls)
       )}
     ] | from_entries |
     { version: "0.5", log_level: "fatal", processes: . }
