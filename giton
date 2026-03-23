@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Colors (disabled if not a terminal)
+# Colors as raw escape bytes (disabled if not a terminal)
 if [[ -t 2 ]]; then
-  BOLD='\033[1m'    DIM='\033[2m'
-  RED='\033[31m'    GREEN='\033[32m'
-  YELLOW='\033[33m' CYAN='\033[36m'
-  RESET='\033[0m'
+  BOLD=$'\033[1m'    DIM=$'\033[2m'
+  RED=$'\033[31m'    GREEN=$'\033[32m'
+  YELLOW=$'\033[33m' CYAN=$'\033[36m'
+  RESET=$'\033[0m'
   PIPE='│'
 else
   BOLD='' DIM='' RED='' GREEN='' YELLOW='' CYAN='' RESET=''
   PIPE='|'
 fi
 
-log()   { echo -e "${CYAN}${BOLD}==>${RESET} $*" >&2; }
-info()  { echo -e "    ${DIM}$*${RESET}" >&2; }
-err()   { echo -e "${RED}${BOLD}Error:${RESET} $*" >&2; }
-ok()    { echo -e "${GREEN}${BOLD}==>${RESET} $*" >&2; }
-warn()  { echo -e "${YELLOW}${BOLD}==>${RESET} $*" >&2; }
+log()   { printf '%s\n' "${CYAN}${BOLD}==>${RESET} $*" >&2; }
+info()  { printf '%s\n' "    ${DIM}$*${RESET}" >&2; }
+err()   { printf '%s\n' "${RED}${BOLD}Error:${RESET} $*" >&2; }
+ok()    { printf '%s\n' "${GREEN}${BOLD}==>${RESET} $*" >&2; }
+warn()  { printf '%s\n' "${YELLOW}${BOLD}==>${RESET} $*" >&2; }
 
 fmt_time() {
   local s=$1
@@ -100,14 +100,12 @@ SHA=$(git rev-parse HEAD)
 # Build context: giton/<name> without --system, giton/<name>/<system> with
 if [[ "$SYSTEM_EXPLICIT" == true ]]; then
   CONTEXT="giton/${NAME}/${SYSTEM}"
-  OUTPUT_PREFIX="${NAME}/${SYSTEM}"
 else
   CONTEXT="giton/${NAME}"
-  OUTPUT_PREFIX="${NAME}"
 fi
 
-# Build sed prefix for command output
-SED_PREFIX="${DIM}${OUTPUT_PREFIX} ${PIPE}${RESET} "
+# Prefix for command output lines (context without "giton/" prefix)
+LINE_PREFIX="${DIM}${CONTEXT#giton/} ${PIPE}${RESET} "
 
 # Get owner/repo from gh
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
@@ -186,6 +184,13 @@ save_host() {
   fi
 }
 
+# Run a command with stdout/stderr prefixed by LINE_PREFIX
+run_prefixed() {
+  EXIT_CODE=0
+  { "$@" 2>&1 || EXIT_CODE=$?; } > >(sed -u $'s\x01^\x01'"${LINE_PREFIX}"$'\x01' >&2)
+  wait
+}
+
 CMD_START=$SECONDS
 
 if [[ "$REMOTE" == true ]]; then
@@ -208,9 +213,7 @@ if [[ "$REMOTE" == true ]]; then
   log "Copying repo to ${BOLD}${HOST}${RESET}..."
   git archive --format=tar HEAD | ssh "$HOST" "mkdir -p '$REMOTE_DIR' && tar -C '$REMOTE_DIR' -x"
 
-  EXIT_CODE=0
-  { ssh "$HOST" "cd '$REMOTE_DIR' && ${CMD[*]}" 2>&1 || EXIT_CODE=$?; } > >(sed -u $'s\x01^\x01'"${SED_PREFIX}"$'\x01' >&2)
-  wait
+  run_prefixed ssh "$HOST" "cd '$REMOTE_DIR' && ${CMD[*]}"
 else
   # Local execution: git archive to tmpdir
   TMPDIR=$(mktemp -d "/tmp/giton-${SHA:0:12}-XXXXXX")
@@ -222,9 +225,7 @@ else
   log "Extracting repo..."
   git archive --format=tar HEAD | tar -C "$TMPDIR" -x
 
-  EXIT_CODE=0
-  { (cd "$TMPDIR" && "${CMD[@]}") 2>&1 || EXIT_CODE=$?; } > >(sed -u $'s\x01^\x01'"${SED_PREFIX}"$'\x01' >&2)
-  wait
+  run_prefixed bash -c "cd '$TMPDIR' && $(printf '%q ' "${CMD[@]}")"
 fi
 
 ELAPSED=$(fmt_time $(( SECONDS - CMD_START )))
