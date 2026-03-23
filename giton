@@ -217,7 +217,7 @@ if [[ -n "$CONFIG_FILE" ]]; then
       { key: $name, value: (
         { command: $command, working_dir: $wd,
           log_location: $logfile,
-          namespace: (if $sys then $hosts[$sys] // $sys else null end),
+          namespace: (if $sys then $sys + " (" + ($hosts[$sys] // "local") + ")" else null end),
           availability: { restart: "exit_on_failure" } }
         + if $depends then { depends_on: $depends } else {} end
         | del(.namespace | nulls)
