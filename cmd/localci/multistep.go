@@ -313,6 +313,17 @@ func generatePCConfig(
 		}
 
 		processes[p.key] = proc
+
+		// In MCP mode, add a companion resource to read each step's log file
+		if mcpMode {
+			logFile := filepath.Join(logDir, sanitizeLogName(p.key)+".log")
+			processes[p.key+" logs"] = pcProcess{
+				Command:    fmt.Sprintf("cat '%s' 2>/dev/null || echo 'No logs yet (step has not run)'", logFile),
+				WorkingDir: cwd,
+				Disabled:   true,
+				MCP:        &pcMCP{Type: "resource"},
+			}
+		}
 	}
 
 	cfg := pcConfig{
