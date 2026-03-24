@@ -63,9 +63,18 @@ type pcProcess struct {
 	LogLocation  string                    `json:"log_location"`
 	Namespace    string                    `json:"namespace,omitempty"`
 	Availability *pcAvailability           `json:"availability,omitempty"`
+	Shutdown     *pcShutdown               `json:"shutdown,omitempty"`
 	DependsOn    map[string]pcDependency   `json:"depends_on,omitempty"`
 	Disabled     bool                      `json:"disabled,omitempty"`
 	MCP          *pcMCP                    `json:"mcp,omitempty"`
+}
+
+// pcShutdown configures how process-compose terminates a process.
+// signal 9 (SIGKILL) ensures immediate termination — nix build and
+// similar tools often ignore SIGTERM, causing the TUI to hang on
+// "Terminating".
+type pcShutdown struct {
+	Signal int `json:"signal"`
 }
 
 type pcMCP struct {
@@ -322,10 +331,11 @@ func generatePCConfig(
 		}
 
 		proc := pcProcess{
-			Command:    strings.Join(cmdParts, " "),
-			WorkingDir: cwd,
+			Command:     strings.Join(cmdParts, " "),
+			WorkingDir:  cwd,
 			LogLocation: filepath.Join(logDir, sanitizeLogName(p.key)+".log"),
-			DependsOn:  depends,
+			Shutdown:    &pcShutdown{Signal: 9},
+			DependsOn:   depends,
 		}
 		if mcpMode {
 			proc.Disabled = true
