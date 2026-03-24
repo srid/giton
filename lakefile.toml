@@ -1,0 +1,7 @@
+name = "giton"
+version = "0.1.0"
+defaultTargets = ["giton"]
+
+[[lean_exe]]
+name = "giton"
+root = "Main"

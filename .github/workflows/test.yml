@@ -6,6 +6,7 @@ on:
 
 jobs:
   build:
+    # Lean 4 nix packaging has upstream issues on macOS (libleanshared dylib)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,4 +18,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: nixbuild/nix-quick-install-action@v34
-      - run: nix run ./test
+      - run: nix run .#test
