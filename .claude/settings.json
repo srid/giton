@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "localci": {
-      "command": "nix",
-      "args": ["run", "github:srid/localci/mcp-integration", "--", "--mcp", "--sha", "HEAD", "-f", "localci.json"],
-      "cwd": "/home/srid/code/giton"
-    }
-  }
-}
