@@ -316,15 +316,16 @@ func generatePCConfig(
 		}
 
 		proc := pcProcess{
-			Command:      strings.Join(cmdParts, " "),
-			WorkingDir:   cwd,
-			LogLocation:  filepath.Join(logDir, sanitizeLogName(p.key)+".log"),
-			Availability: &pcAvailability{Restart: "exit_on_failure"},
-			DependsOn:    depends,
+			Command:    strings.Join(cmdParts, " "),
+			WorkingDir: cwd,
+			LogLocation: filepath.Join(logDir, sanitizeLogName(p.key)+".log"),
+			DependsOn:  depends,
 		}
 		if mcpMode {
 			proc.Disabled = true
 			proc.MCP = &pcMCP{Type: "tool"}
+		} else {
+			proc.Availability = &pcAvailability{Restart: "exit_on_failure"}
 		}
 		if p.sys != "" {
 			hostname := hostMap[p.sys]
