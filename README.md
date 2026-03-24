@@ -8,6 +8,9 @@ nix run github:srid/giton -- -- nix build
 
 giton extracts the repo at HEAD into a temp directory (via `git archive`), runs the command there, and posts a GitHub commit status. The clean extraction means your uncommitted changes can't leak into the build. The working tree must be clean, or giton refuses to run.
 
+<img width="1220" height="1010" alt="image" src="https://github.com/user-attachments/assets/2c687668-5f08-425c-922a-7595b2bef5b0" />
+
+
 ## Cross-system builds
 
 Pass `-s` to run on a different Nix platform. giton pipes the archive over SSH and executes remotely:
