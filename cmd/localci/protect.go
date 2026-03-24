@@ -12,15 +12,9 @@ import (
 // the step×system matrix), and sets them as required status checks on
 // the repo's default branch via gh api.
 func runProtect(args cliArgs) int {
-	data, err := os.ReadFile(args.configFile)
+	config, err := loadConfig(args.configFile)
 	if err != nil {
-		logErr("Failed to read config: %v", err)
-		return 1
-	}
-
-	var config MultiStepConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		logErr("Failed to parse config: %v", err)
+		logErr("%v", err)
 		return 1
 	}
 

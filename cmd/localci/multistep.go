@@ -24,6 +24,22 @@ type MultiStepConfig struct {
 	Steps map[string]StepConfig `json:"steps"`
 }
 
+// loadConfig reads and parses a localci JSON config file.
+func loadConfig(path string) (MultiStepConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return MultiStepConfig{}, fmt.Errorf("config file not found: %s", path)
+		}
+		return MultiStepConfig{}, err
+	}
+	var config MultiStepConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return MultiStepConfig{}, fmt.Errorf("failed to parse config: %w", err)
+	}
+	return config, nil
+}
+
 // Process-compose config types. We generate a JSON config file and hand it
 // to process-compose for parallel step orchestration with dependency ordering.
 type pcConfig struct {
@@ -76,19 +92,9 @@ type processEntry struct {
 // generates a process-compose config, and runs all steps in parallel.
 // Each step self-invokes localci in single-step mode with --sha pinning.
 func runMultiStep(args cliArgs, sha string) int {
-	data, err := os.ReadFile(args.configFile)
+	config, err := loadConfig(args.configFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			logErr("Config file not found: %s", args.configFile)
-		} else {
-			logErr("Failed to read config: %v", err)
-		}
-		return 1
-	}
-
-	var config MultiStepConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		logErr("Failed to parse config: %v", err)
+		logErr("%v", err)
 		return 1
 	}
 
@@ -182,22 +188,6 @@ func runMultiStep(args cliArgs, sha string) int {
 	}
 	pcFile.Close()
 
-	// Cleanup temp dirs on exit
-	defer func() {
-		os.RemoveAll(logDir)
-		if !args.mcp {
-			workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
-			os.RemoveAll(localDir)
-			for _, sys := range allSystems {
-				if sys != currentSystem {
-					host := hostMap[sys]
-					rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
-					exec.Command("ssh", host, "rm -rf '"+rdir+"'").Run()
-				}
-			}
-		}
-	}()
-
 	// Run process-compose
 	pcArgs := []string{"up", "--config", pcFile.Name()}
 	if args.mcp {
@@ -212,6 +202,22 @@ func runMultiStep(args cliArgs, sha string) int {
 	pcCmd.Stderr = os.Stderr
 	pcCmd.Stdin = os.Stdin
 	pcExit := exitCode(pcCmd.Run())
+
+	// Cleanup temp dirs. Keep log dir on failure for debugging.
+	if pcExit == 0 {
+		os.RemoveAll(logDir)
+	}
+	if !args.mcp {
+		workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
+		os.RemoveAll(localDir)
+		for _, sys := range allSystems {
+			if sys != currentSystem {
+				host := hostMap[sys]
+				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
+				exec.Command("ssh", host, "rm -rf '"+rdir+"'").Run()
+			}
+		}
+	}
 
 	// Print summary (skip in MCP mode — agent reads structured MCP responses)
 	if !args.mcp {

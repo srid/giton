@@ -19,7 +19,7 @@ func runSingleStep(args cliArgs, sha string) int {
 		name = filepath.Base(args.cmd[0])
 	}
 
-	// Status context: "giton/<name>" without --system, "giton/<name>/<system>" with
+	// Status context: "localci/<name>" without --system, "localci/<name>/<system>" with
 	var context string
 	if args.systemExplicit {
 		context = fmt.Sprintf("localci/%s/%s", name, args.system)
