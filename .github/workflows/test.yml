@@ -5,23 +5,15 @@ on:
   pull_request:
 
 jobs:
-  build:
+  ci:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: nixbuild/nix-quick-install-action@v34
-      - run: nix build
-
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: nixbuild/nix-quick-install-action@v34
-      - run: nix run .#test
-
+      - run: nix run . -- --sha ${{ github.sha }} -n build -- nix build
+      - run: nix run . -- --sha ${{ github.sha }} -n test -- nix run .#test
