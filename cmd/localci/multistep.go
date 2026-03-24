@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // StepConfig represents a step in the multi-step config file (localci.json).
@@ -46,7 +48,7 @@ type pcProcess struct {
 	WorkingDir   string                    `json:"working_dir"`
 	LogLocation  string                    `json:"log_location"`
 	Namespace    string                    `json:"namespace,omitempty"`
-	Availability pcAvailability            `json:"availability"`
+	Availability *pcAvailability           `json:"availability,omitempty"`
 	DependsOn    map[string]pcDependency   `json:"depends_on,omitempty"`
 	Disabled     bool                      `json:"disabled,omitempty"`
 	MCP          *pcMCP                    `json:"mcp,omitempty"`
@@ -201,7 +203,23 @@ func runMultiStep(args cliArgs, sha string) int {
 	pcCmd.Stdout = os.Stdout
 	pcCmd.Stderr = os.Stderr
 	pcCmd.Stdin = os.Stdin
-	pcExit := exitCode(pcCmd.Run())
+	// Run in its own process group so we can signal it cleanly
+	pcCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := pcCmd.Start(); err != nil {
+		logErr("Failed to start process-compose: %v", err)
+		return 1
+	}
+	// Forward SIGINT/SIGTERM to the process-compose process group
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		if pcCmd.Process != nil {
+			syscall.Kill(-pcCmd.Process.Pid, sig.(syscall.Signal))
+		}
+	}()
+	pcExit := exitCode(pcCmd.Wait())
+	signal.Stop(sigCh)
 
 	// Print summary (skip in MCP mode — agent reads structured MCP responses)
 	if !args.mcp {
@@ -297,7 +315,7 @@ func generatePCConfig(
 			Command:      strings.Join(cmdParts, " "),
 			WorkingDir:   cwd,
 			LogLocation:  filepath.Join(logDir, sanitizeLogName(p.key)+".log"),
-			Availability: pcAvailability{Restart: "exit_on_failure"},
+			Availability: &pcAvailability{Restart: "exit_on_failure"},
 			DependsOn:    depends,
 		}
 		if mcpMode {
