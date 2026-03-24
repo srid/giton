@@ -57,7 +57,7 @@ var validHostname = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 func getRemoteHost(system string) (string, error) {
 	hosts, _ := loadHosts()
 	if host, ok := hosts[system]; ok && host != "" {
-		logMsg("Using saved host for %s: %s%s%s", system, bold, host, reset)
+		logMsg("Using saved host for %s: %s", system, cBold(host))
 		return host, nil
 	}
 

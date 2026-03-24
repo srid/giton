@@ -28,7 +28,7 @@ func runSingleStep(args cliArgs, sha string) int {
 		return 1
 	}
 
-	logMsg("%s%s%s  %s%s@%s%s", bold, context, reset, dim, repo, shortSHA(sha), reset)
+	logMsg("%s  %s", cBold(context), cDim(repo+"@"+shortSHA(sha)))
 	logInfo("%s", strings.Join(args.cmd, " "))
 
 	postStatus(repo, sha, "pending", context, "Running: "+strings.Join(args.cmd, " "))
@@ -61,7 +61,7 @@ func runSingleStep(args cliArgs, sha string) int {
 
 		ensureSSHControlDir(host)
 
-		logMsg("Copying repo to %s%s%s...", bold, host, reset)
+		logMsg("Copying repo to %s...", cBold(host))
 		if err := extractRepoRemote(sha, host, remoteDir); err != nil {
 			logErr("Failed to extract repo remotely: %v", err)
 			return 1
@@ -89,10 +89,10 @@ func runSingleStep(args cliArgs, sha string) int {
 	cmdStr := strings.Join(args.cmd, " ")
 
 	if rc == 0 {
-		logOk("%s%s%s passed in %s%s%s", bold, context, reset, green, elapsed, reset)
+		logOk("%s passed in %s", cBold(context), cGreen(elapsed))
 		postStatus(repo, sha, "success", context, fmt.Sprintf("Passed in %s: %s", elapsed, cmdStr))
 	} else {
-		logWarn("%s%s%s failed (exit %d) in %s%s%s", bold, context, reset, rc, yellow, elapsed, reset)
+		logWarn("%s failed (exit %d) in %s", cBold(context), rc, cYellow(elapsed))
 		postStatus(repo, sha, "failure", context, fmt.Sprintf("Failed (exit %d) in %s: %s", rc, elapsed, cmdStr))
 	}
 

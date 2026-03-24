@@ -4,61 +4,39 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/fatih/color"
 )
 
 var (
-	bold   string
-	dim    string
-	red    string
-	green  string
-	yellow string
-	cyan   string
-	reset  string
+	cBold   = color.New(color.Bold).SprintFunc()
+	cDim    = color.New(color.Faint).SprintFunc()
+	cHeader = color.New(color.FgCyan, color.Bold).SprintFunc()
+	cOk     = color.New(color.FgGreen, color.Bold).SprintFunc()
+	cWarn   = color.New(color.FgYellow, color.Bold).SprintFunc()
+	cErr    = color.New(color.FgRed, color.Bold).SprintFunc()
+	cGreen  = color.New(color.FgGreen).SprintFunc()
+	cYellow = color.New(color.FgYellow).SprintFunc()
 )
 
-func init() {
-	if isTerminal(os.Stderr) {
-		bold = "\033[1m"
-		dim = "\033[2m"
-		red = "\033[31m"
-		green = "\033[32m"
-		yellow = "\033[33m"
-		cyan = "\033[36m"
-		reset = "\033[0m"
-	}
-}
-
-func isTerminal(f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
-
 func logMsg(msg string, args ...any) {
-	s := fmt.Sprintf(msg, args...)
-	fmt.Fprintf(os.Stderr, "%s%s==>%s %s\n", cyan, bold, reset, s)
+	fmt.Fprintf(os.Stderr, "%s %s\n", cHeader("==>"), fmt.Sprintf(msg, args...))
 }
 
 func logInfo(msg string, args ...any) {
-	s := fmt.Sprintf(msg, args...)
-	fmt.Fprintf(os.Stderr, "    %s%s%s\n", dim, s, reset)
+	fmt.Fprintf(os.Stderr, "    %s\n", cDim(fmt.Sprintf(msg, args...)))
 }
 
 func logErr(msg string, args ...any) {
-	s := fmt.Sprintf(msg, args...)
-	fmt.Fprintf(os.Stderr, "%s%sError:%s %s\n", red, bold, reset, s)
+	fmt.Fprintf(os.Stderr, "%s %s\n", cErr("Error:"), fmt.Sprintf(msg, args...))
 }
 
 func logOk(msg string, args ...any) {
-	s := fmt.Sprintf(msg, args...)
-	fmt.Fprintf(os.Stderr, "%s%s==>%s %s\n", green, bold, reset, s)
+	fmt.Fprintf(os.Stderr, "%s %s\n", cOk("==>"), fmt.Sprintf(msg, args...))
 }
 
 func logWarn(msg string, args ...any) {
-	s := fmt.Sprintf(msg, args...)
-	fmt.Fprintf(os.Stderr, "%s%s==>%s %s\n", yellow, bold, reset, s)
+	fmt.Fprintf(os.Stderr, "%s %s\n", cWarn("==>"), fmt.Sprintf(msg, args...))
 }
 
 func fmtDuration(d time.Duration) string {

@@ -75,7 +75,7 @@ func runMultiStep(args cliArgs, sha string) int {
 		return 1
 	}
 
-	logMsg("Multi-step mode: %s%s%s  %sSHA=%s%s", bold, args.configFile, reset, dim, shortSHA(sha), reset)
+	logMsg("Multi-step mode: %s  %s", cBold(args.configFile), cDim("SHA="+shortSHA(sha)))
 
 	currentSystem := getCurrentSystem()
 	cwd, _ := os.Getwd()
@@ -94,7 +94,7 @@ func runMultiStep(args cliArgs, sha string) int {
 			}
 			hostMap[sys] = host
 			// Warm SSH connection
-			logMsg("Warming SSH connection to %s%s%s (%s)...", bold, host, reset, sys)
+			logMsg("Warming SSH connection to %s (%s)...", cBold(host), sys)
 			exec.Command("ssh", host, "echo", "ok").Run()
 		}
 	}
@@ -117,7 +117,7 @@ func runMultiStep(args cliArgs, sha string) int {
 		if sys != currentSystem {
 			host := hostMap[sys]
 			rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
-			logMsg("Extracting repo on %s%s%s (%s)...", bold, host, reset, sys)
+			logMsg("Extracting repo on %s (%s)...", cBold(host), sys)
 			if err := extractRepoRemote(sha, host, rdir); err != nil {
 				logErr("Failed to extract repo on %s: %v", host, err)
 				return 1
@@ -344,7 +344,7 @@ func printFailedLogs(logDir string) {
 		}
 		stepName := strings.TrimSuffix(entry.Name(), ".log")
 		fmt.Fprintln(os.Stderr)
-		logWarn("%s%s%s:", bold, stepName, reset)
+		logWarn("%s:", cBold(stepName))
 
 		// Parse JSON log lines and extract messages
 		for _, line := range strings.Split(content, "\n") {
