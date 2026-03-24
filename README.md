@@ -120,6 +120,18 @@ Run CI via the localci MCP tools after making changes. If a step fails, fix the 
 
 Each step from `localci.json` appears as an MCP tool (named `mcp__localci__<step>`). Dependencies are respected — invoking a step auto-starts its dependencies first. Steps can be re-invoked after fixing code. Step logs are exposed as MCP resources for diagnosis.
 
+### Branch protection
+
+Require localci checks to pass before merging PRs. This reads step names from `localci.json` and sets them as required status checks:
+
+```bash
+gh api repos/OWNER/REPO/branches/main/protection -X PUT \
+  --input <(jq -n --argjson contexts \
+    "$(jq '[.steps | keys[] | "localci/" + .]' localci.json)" \
+    '{required_status_checks: {strict: true, contexts: $contexts},
+      enforce_admins: false, required_pull_request_reviews: null, restrictions: null}')
+```
+
 ## Reference
 
 ```
