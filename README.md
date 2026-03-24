@@ -1,85 +1,56 @@
 # giton
 
-Local CI tool — run commands on specific Nix platforms and post GitHub commit statuses.
-
-## Usage
-
-### Single-step mode
+CI from your terminal. Run `nix build` on your laptop and the result shows up as a green check on the GitHub PR — same as hosted CI, but without the runner.
 
 ```bash
-nix run github:srid/giton -- [-s <nix-system>] [-n <check-name>] -- <command...>
+nix run github:srid/giton -- -- nix build
 ```
 
-### Multi-step mode
+giton extracts the repo at HEAD into a temp directory (via `git archive`), runs the command there, and posts a GitHub commit status. The clean extraction means your uncommitted changes can't leak into the build. The working tree must be clean, or giton refuses to run.
+
+## Cross-system builds
+
+Pass `-s` to run on a different Nix platform. giton pipes the archive over SSH and executes remotely:
 
 ```bash
-nix run github:srid/giton -- -f giton.json
+nix run github:srid/giton -- -s aarch64-darwin -n build -- nix build
 ```
 
-Define steps with systems, commands, and dependencies in a JSON config:
+On first use, giton prompts for the SSH hostname for that system. The mapping is saved to `$XDG_CONFIG_HOME/giton/hosts.json` and reused on subsequent runs.
+
+The GitHub status context includes the system: `giton/build/aarch64-darwin`.
+
+## Multi-step
+
+For projects with multiple CI steps, define them in a JSON config:
 
 ```json
 {
   "steps": {
-    "nix": {
+    "build": {
       "systems": ["x86_64-linux", "aarch64-darwin"],
       "command": "nix build"
     },
-    "e2e": {
+    "test": {
       "systems": ["x86_64-linux", "aarch64-darwin"],
-      "command": "just test",
-      "depends_on": ["nix"]
+      "command": "nix run .#test",
+      "depends_on": ["build"]
     }
   }
 }
 ```
 
-Steps run in parallel across systems. Dependencies are resolved per-system — `e2e/x86_64-linux` waits for `nix/x86_64-linux` but not `nix/aarch64-darwin`. If a step fails, its dependents won't start, but independent steps continue running. Orchestration is handled by [process-compose](https://github.com/F1bonacc1/process-compose).
-
-### Examples
-
 ```bash
-# Build on current system (status: giton/nix)
-nix run github:srid/giton -- -- nix build
-
-# Build on a specific platform (status: giton/build/aarch64-darwin)
-nix run github:srid/giton -- -s aarch64-darwin -n build -- nix build
-
-# Run multi-step CI from config
 nix run github:srid/giton -- -f giton.json
-
-# Pin to a specific commit (skips clean-tree check)
-nix run github:srid/giton -- --sha abc123def -- nix build
 ```
 
-## What it does
+This expands into a step×system matrix: `build` and `test` each run on both systems, in parallel. Dependencies resolve per-system — `test` on x86_64-linux waits for `build` on x86_64-linux, not on aarch64-darwin. Each cell in the matrix gets its own GitHub commit status.
 
-1. Pins the current HEAD commit SHA (or uses `--sha` if provided)
-2. Validates that the git working tree is clean (unless `--sha` is given)
-3. Posts a **pending** GitHub commit status
-4. Extracts the repo at the pinned SHA to a temp directory via `git archive`
-5. Runs the command in that clean checkout
-6. Posts **success** or **failure** based on the exit code
-7. Cleans up the temp directory
-
-In multi-step mode, giton generates a process-compose config and orchestrates all steps with proper dependency ordering and parallelism. Each step gets its own GitHub commit status.
-
-Status context: `giton/<name>` without `--system`, `giton/<name>/<system>` with it.
-
-When `--system` doesn't match the current host, giton copies the repo to a remote machine via `git archive | ssh` and runs the command there. On first use it prompts for an SSH hostname; subsequent runs reuse the saved host from `$XDG_CONFIG_HOME/giton/hosts.json`.
+Under the hood, giton generates a [process-compose](https://github.com/F1bonacc1/process-compose) config and delegates orchestration to it. Each step is a self-invocation of giton with `--sha` pinning. Pass `--tui` to get the process-compose terminal UI.
 
 ## GitHub Actions
 
-giton can dogfood itself in CI — each step gets a commit status on the PR. Define your steps in a JSON config:
-
-```json
-{
-  "steps": {
-    "build": { "command": "nix build" },
-    "test": { "command": "nix run .#test", "depends_on": ["build"] }
-  }
-}
-```
+giton works in hosted CI too. Use `--sha` to pin to the PR commit (the clean-tree check doesn't apply in CI since there's no working tree to protect):
 
 ```yaml
 jobs:
@@ -96,15 +67,20 @@ jobs:
       - run: nix run github:srid/giton -- --sha ${{ github.sha }} -f giton.json
 ```
 
-`--sha` pins to the PR commit (skipping the clean-tree check that doesn't apply in CI). `GH_TOKEN` gives `gh` the credentials to post statuses. Each step shows up as `giton/build` and `giton/test` in the PR checks.
+Each step posts its own commit status (`giton/build`, `giton/test`), so the PR shows fine-grained check results even though it's a single CI job.
 
-## Install
+## Reference
 
-```bash
-nix run github:srid/giton -- --help
+```
+giton [options] -- <command...>    Single-step mode
+giton -f <config.json>             Multi-step mode
+
+Options:
+  -s, --system <system>   Nix system to run on (remote if different from current host)
+  -n, --name <name>       GitHub status check name (default: command basename)
+  -f, --file <path>       Multi-step JSON config
+  --sha <sha>             Pin to a commit SHA (skips clean-tree check)
+  --tui                   Show process-compose TUI (multi-step only)
 ```
 
-## Requirements
-
-- `git`, `gh` (authenticated), `nix`
-- Must be run inside a clean git repository with a GitHub remote
+Requires `git`, [`gh`](https://cli.github.com/) (authenticated), and `nix`. Must be run inside a git repository with a GitHub remote.
