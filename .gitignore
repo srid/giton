@@ -2,3 +2,4 @@ result
 .lake
 lake-packages
 build
+.zig-cache/
