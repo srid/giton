@@ -59,6 +59,7 @@ type cliArgs struct {
 	shaPin         string
 	configFile     string
 	tui            bool
+	mcp            bool
 	workdir        string // pre-extracted dir, set by multi-step self-invocation
 }
 
@@ -70,6 +71,7 @@ func parseArgs() cliArgs {
 	flag.StringVar(&a.shaPin, "sha", "", "Pin to a specific commit SHA (skips clean-tree check)")
 	flag.StringVarP(&a.configFile, "file", "f", "", "JSON config file defining steps, systems, and dependencies")
 	flag.BoolVar(&a.tui, "tui", false, "Enable process-compose TUI (multi-step mode only)")
+	flag.BoolVar(&a.mcp, "mcp", false, "Expose steps as MCP tools via process-compose (multi-step mode only)")
 	flag.StringVar(&a.workdir, "workdir", "", "Pre-extracted working directory (internal, used by multi-step mode)")
 
 	flag.Usage = func() {

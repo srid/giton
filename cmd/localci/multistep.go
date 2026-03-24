@@ -29,7 +29,12 @@ type MultiStepConfig struct {
 type pcConfig struct {
 	Version          string               `json:"version"`
 	LogConfiguration pcLogConfig          `json:"log_configuration"`
+	MCPServer        *pcMCPServer         `json:"mcp_server,omitempty"`
 	Processes        map[string]pcProcess `json:"processes"`
+}
+
+type pcMCPServer struct {
+	Transport string `json:"transport"`
 }
 
 type pcLogConfig struct {
@@ -43,6 +48,12 @@ type pcProcess struct {
 	Namespace    string                    `json:"namespace,omitempty"`
 	Availability pcAvailability            `json:"availability"`
 	DependsOn    map[string]pcDependency   `json:"depends_on,omitempty"`
+	Disabled     bool                      `json:"disabled,omitempty"`
+	MCP          *pcMCP                    `json:"mcp,omitempty"`
+}
+
+type pcMCP struct {
+	Type string `json:"type"`
 }
 
 type pcAvailability struct {
@@ -147,7 +158,7 @@ func runMultiStep(args cliArgs, sha string) int {
 	}
 
 	// Generate process-compose config
-	pcCfg := generatePCConfig(procs, config, sha, self, cwd, logDir, hostMap, workdirMap)
+	pcCfg := generatePCConfig(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, args.mcp)
 
 	// Write process-compose config to temp file
 	pcFile, err := os.CreateTemp("", "localci-pc-*.json")
@@ -178,21 +189,31 @@ func runMultiStep(args cliArgs, sha string) int {
 	}()
 
 	// Run process-compose
-	pcCmd := exec.Command("process-compose", "up",
-		"--tui="+strconv.FormatBool(args.tui), "--no-server", "--config", pcFile.Name())
+	pcArgs := []string{"up", "--config", pcFile.Name()}
+	if args.mcp {
+		// MCP mode: stdio transport, no --no-server (process-compose stays
+		// running and accepts MCP tool invocations from the connected agent)
+		pcArgs = append(pcArgs, "--tui=false")
+	} else {
+		pcArgs = append(pcArgs, "--tui="+strconv.FormatBool(args.tui), "--no-server")
+	}
+	pcCmd := exec.Command("process-compose", pcArgs...)
 	pcCmd.Stdout = os.Stdout
 	pcCmd.Stderr = os.Stderr
+	pcCmd.Stdin = os.Stdin
 	pcExit := exitCode(pcCmd.Run())
 
-	// Print summary
-	fmt.Fprintln(os.Stderr)
-	if pcExit == 0 {
-		logOk("All steps passed")
-	} else {
-		logWarn("One or more steps failed (exit %d)", pcExit)
-		logInfo("Logs: %s/", logDir)
-		if !args.tui {
-			printFailedLogs(logDir)
+	// Print summary (skip in MCP mode — agent reads structured MCP responses)
+	if !args.mcp {
+		fmt.Fprintln(os.Stderr)
+		if pcExit == 0 {
+			logOk("All steps passed")
+		} else {
+			logWarn("One or more steps failed (exit %d)", pcExit)
+			logInfo("Logs: %s/", logDir)
+			if !args.tui {
+				printFailedLogs(logDir)
+			}
 		}
 	}
 
@@ -242,6 +263,7 @@ func generatePCConfig(
 	procs []processEntry, config MultiStepConfig,
 	sha, self, cwd, logDir string,
 	hostMap, workdirMap map[string]string,
+	mcpMode bool,
 ) pcConfig {
 	processes := make(map[string]pcProcess)
 
@@ -278,6 +300,10 @@ func generatePCConfig(
 			Availability: pcAvailability{Restart: "exit_on_failure"},
 			DependsOn:    depends,
 		}
+		if mcpMode {
+			proc.Disabled = true
+			proc.MCP = &pcMCP{Type: "tool"}
+		}
 		if p.sys != "" {
 			hostname := hostMap[p.sys]
 			if hostname == "" {
@@ -289,11 +315,15 @@ func generatePCConfig(
 		processes[p.key] = proc
 	}
 
-	return pcConfig{
+	cfg := pcConfig{
 		Version:          "0.5",
 		LogConfiguration: pcLogConfig{FlushEachLine: true},
 		Processes:        processes,
 	}
+	if mcpMode {
+		cfg.MCPServer = &pcMCPServer{Transport: "stdio"}
+	}
+	return cfg
 }
 
 var logNameReplacer = strings.NewReplacer("/", "-", " ", "-", "(", "-", ")", "-")

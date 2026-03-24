@@ -77,6 +77,29 @@ jobs:
 
 Each step posts its own commit status (`localci/build`, `localci/test`), so the PR shows fine-grained check results even though it's a single CI job.
 
+## Agent integration (MCP)
+
+localci can expose CI steps as [MCP](https://modelcontextprotocol.io/) tools via process-compose's built-in MCP server. Coding agents (Claude Code, etc.) connect over stdio and invoke steps individually.
+
+```bash
+localci --mcp -f localci.json
+```
+
+Add to your MCP client config (e.g. `.claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "localci": {
+      "command": "nix",
+      "args": ["run", "github:srid/localci", "--", "--mcp", "-f", "localci.json"]
+    }
+  }
+}
+```
+
+Each step appears as an MCP tool. Dependencies are respected — invoking "test" auto-starts "build" first. Steps can be re-invoked after fixing code.
+
 ## Reference
 
 ```
@@ -89,6 +112,7 @@ Options:
   -f, --file <path>       Multi-step JSON config
   --sha <sha>             Pin to a commit SHA (skips clean-tree check)
   --tui                   Show process-compose TUI (multi-step only)
+  --mcp                   Expose steps as MCP tools (multi-step only)
 ```
 
 Requires `git`, [`gh`](https://cli.github.com/) (authenticated), and `nix`. Must be run inside a git repository with a GitHub remote.
