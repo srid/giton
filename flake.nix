@@ -16,6 +16,7 @@
             version = "0.1.0";
             src = ./.;
             vendorHash = "sha256-0rbdfZLARlCeyUXRGWUZ/g36S1YV9tAyCm6eupGloEE=";
+            subPackages = [ "cmd/giton" ];
             meta.description = "Local CI tool — run commands on Nix platforms with GitHub status reporting";
           };
           testFiles = pkgs.runCommand "giton-test-files" { } ''
