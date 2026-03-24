@@ -41,6 +41,17 @@ else
   fail "failure propagates exit code (rc=$RC)"
 fi
 
+# Independent step failure propagates
+cat > "$WORK/indep-fail.json" << 'EOF'
+{"steps":{"good":{"command":"echo ok"},"bad":{"command":"exit 1"}}}
+EOF
+run_giton --sha "$SHA" -f "$WORK/indep-fail.json"
+if [[ $RC -ne 0 ]]; then
+  pass "independent step failure propagates exit code"
+else
+  fail "independent step failure propagates exit code (rc=$RC)"
+fi
+
 # Log files created on failure
 rm -rf /tmp/giton-"${SHA:0:12}"-logs
 run_giton --sha "$SHA" -f "$WORK/fail.json"
