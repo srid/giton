@@ -15,20 +15,12 @@ func isInGitRepo() bool {
 }
 
 func isTreeClean() bool {
-	// Check unstaged changes
-	if err := exec.Command("git", "diff", "--quiet").Run(); err != nil {
-		return false
-	}
-	// Check staged changes
-	if err := exec.Command("git", "diff", "--cached", "--quiet").Run(); err != nil {
-		return false
-	}
-	// Check untracked files
-	out, err := exec.Command("git", "ls-files", "--others", "--exclude-standard").Output()
+	// Single porcelain call detects staged, unstaged, and untracked changes
+	out, err := exec.Command("git", "status", "--porcelain").Output()
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(out)) == ""
+	return len(strings.TrimSpace(string(out))) == 0
 }
 
 func resolveHEAD() (string, error) {
@@ -44,43 +36,35 @@ func extractRepoLocal(sha, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	archive := exec.Command("git", "archive", "--format=tar", sha)
 	untar := exec.Command("tar", "-C", dir, "-x")
-	pipe, err := archive.StdoutPipe()
-	if err != nil {
+	if err := pipeGitArchive(sha, untar); err != nil {
 		return err
 	}
-	untar.Stdin = pipe
-	if err := archive.Start(); err != nil {
-		return err
-	}
-	if err := untar.Run(); err != nil {
-		return fmt.Errorf("tar extract: %w", err)
-	}
-	if err := archive.Wait(); err != nil {
-		return fmt.Errorf("git archive: %w", err)
-	}
-	// Ensure writable
 	return exec.Command("chmod", "-R", "u+w", dir).Run()
 }
 
 // extractRepoRemote extracts the repo at the given SHA to a remote host via SSH.
 func extractRepoRemote(sha, host, dir string) error {
-	archive := exec.Command("git", "archive", "--format=tar", sha)
 	sshCmd := exec.Command("ssh", host,
 		fmt.Sprintf("mkdir -p '%s' && tar -C '%s' -x && chmod -R u+w '%s'", dir, dir, dir))
+	sshCmd.Stdout = os.Stdout
+	sshCmd.Stderr = os.Stderr
+	return pipeGitArchive(sha, sshCmd)
+}
+
+// pipeGitArchive pipes git archive output into the given consumer command.
+func pipeGitArchive(sha string, consumer *exec.Cmd) error {
+	archive := exec.Command("git", "archive", "--format=tar", sha)
 	pipe, err := archive.StdoutPipe()
 	if err != nil {
 		return err
 	}
-	sshCmd.Stdin = pipe
-	sshCmd.Stdout = os.Stdout
-	sshCmd.Stderr = os.Stderr
+	consumer.Stdin = pipe
 	if err := archive.Start(); err != nil {
 		return err
 	}
-	if err := sshCmd.Run(); err != nil {
-		return fmt.Errorf("ssh extract: %w", err)
+	if err := consumer.Run(); err != nil {
+		return fmt.Errorf("consumer: %w", err)
 	}
 	if err := archive.Wait(); err != nil {
 		return fmt.Errorf("git archive: %w", err)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -140,7 +141,17 @@ func runMultiStep(args cliArgs, sha string) int {
 	}
 
 	// Generate process-compose config
-	pcCfg := generatePCConfig(config, procs, sha, self, cwd, logDir, hostMap, workdirMap)
+	ctx := &pcGenContext{
+		config:     config,
+		procs:      procs,
+		sha:        sha,
+		self:       self,
+		cwd:        cwd,
+		logDir:     logDir,
+		hostMap:    hostMap,
+		workdirMap: workdirMap,
+	}
+	pcCfg := ctx.generate()
 
 	// Write process-compose config to temp file
 	pcFile, err := os.CreateTemp("", "giton-pc-*.json")
@@ -211,74 +222,56 @@ func buildProcessEntries(config MultiStepConfig) []processEntry {
 	for stepName, step := range config.Steps {
 		systems := step.Systems
 		if len(systems) == 0 {
-			procs = append(procs, processEntry{
-				step: stepName,
-				sys:  "",
-				key:  stepName,
-			})
-		} else {
-			for _, sys := range systems {
-				var key string
-				if len(systems) == 1 {
-					key = stepName
-				} else {
-					key = fmt.Sprintf("%s (%s)", stepName, sys)
-				}
-				procs = append(procs, processEntry{
-					step: stepName,
-					sys:  sys,
-					key:  key,
-				})
+			systems = []string{""} // no-system sentinel
+		}
+		for _, sys := range systems {
+			key := stepName
+			if sys != "" && len(step.Systems) > 1 {
+				key = fmt.Sprintf("%s (%s)", stepName, sys)
 			}
+			procs = append(procs, processEntry{step: stepName, sys: sys, key: key})
 		}
 	}
 	return procs
 }
 
-func generatePCConfig(
-	config MultiStepConfig,
-	procs []processEntry,
-	sha, self, cwd, logDir string,
-	hostMap, workdirMap map[string]string,
-) pcConfig {
+// pcGenContext bundles the parameters needed for process-compose config generation.
+type pcGenContext struct {
+	config     MultiStepConfig
+	procs      []processEntry
+	sha, self  string
+	cwd        string
+	logDir     string
+	hostMap    map[string]string
+	workdirMap map[string]string
+}
+
+func (c *pcGenContext) generate() pcConfig {
 	processes := make(map[string]pcProcess)
 
-	for _, p := range procs {
-		step := config.Steps[p.step]
+	for _, p := range c.procs {
+		step := c.config.Steps[p.step]
 
-		// Build command: self --sha SHA [-s sys] [--workdir dir] -n step -- command
-		cmdParts := []string{self, "--sha", sha}
+		cmdParts := []string{c.self, "--sha", c.sha}
 		if p.sys != "" {
 			cmdParts = append(cmdParts, "-s", p.sys)
-			if dir, ok := workdirMap[p.sys]; ok {
+			if dir, ok := c.workdirMap[p.sys]; ok {
 				cmdParts = append(cmdParts, "--workdir", dir)
 			}
 		}
 		cmdParts = append(cmdParts, "-n", p.step, "--", step.Command)
 
-		// Resolve dependencies for this system
-		depends := make(map[string]pcDependency)
-		for _, dep := range step.DependsOn {
-			// Find the matching process entry for this dependency + same system
-			for _, dp := range procs {
-				if dp.step == dep && dp.sys == p.sys {
-					depends[dp.key] = pcDependency{Condition: "process_completed_successfully"}
-					break
-				}
-			}
-		}
-
-		// Build log file path
-		logFile := filepath.Join(logDir, sanitizeLogName(p.key)+".log")
+		depends := c.resolveDeps(p, step)
+		logFile := filepath.Join(c.logDir, sanitizeLogName(p.key)+".log")
 
 		proc := pcProcess{
 			Command:      strings.Join(cmdParts, " "),
-			WorkingDir:   cwd,
+			WorkingDir:   c.cwd,
 			LogLocation:  logFile,
 			Availability: pcAvailability{Restart: "exit_on_failure"},
 		}
 		if p.sys != "" {
-			hostname := hostMap[p.sys]
+			hostname := c.hostMap[p.sys]
 			if hostname == "" {
 				hostname = "local"
 			}
@@ -298,14 +291,29 @@ func generatePCConfig(
 	}
 }
 
-var logNameRe = regexp.MustCompile(`[/ ()]`)
+func (c *pcGenContext) resolveDeps(p processEntry, step StepConfig) map[string]pcDependency {
+	if len(step.DependsOn) == 0 {
+		return nil
+	}
+	depends := make(map[string]pcDependency)
+	for _, dep := range step.DependsOn {
+		for _, dp := range c.procs {
+			if dp.step == dep && dp.sys == p.sys {
+				depends[dp.key] = pcDependency{Condition: "process_completed_successfully"}
+				break
+			}
+		}
+	}
+	return depends
+}
+
+var logNameReplacer = strings.NewReplacer("/", "-", " ", "-", "(", "-", ")", "-")
 var multiDash = regexp.MustCompile(`-{2,}`)
 
 func sanitizeLogName(name string) string {
-	s := logNameRe.ReplaceAllString(name, "-")
+	s := logNameReplacer.Replace(name)
 	s = multiDash.ReplaceAllString(s, "-")
-	s = strings.TrimRight(s, "-")
-	return s
+	return strings.TrimRight(s, "-")
 }
 
 func selfPathResolved() (string, error) {
@@ -325,38 +333,38 @@ func mustHostname() string {
 }
 
 func printFailedLogs(logDir string) {
-	entries, err := os.ReadDir(logDir)
+	entries, err := filepath.Glob(filepath.Join(logDir, "*.log"))
 	if err != nil {
 		return
 	}
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".log") {
+	for _, path := range entries {
+		f, err := os.Open(path)
+		if err != nil {
 			continue
 		}
-		path := filepath.Join(logDir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil || len(data) == 0 {
-			continue
-		}
-		content := string(data)
-		if !strings.Contains(content, "failed") {
-			continue
-		}
-		stepName := strings.TrimSuffix(entry.Name(), ".log")
-		fmt.Fprintln(os.Stderr)
-		logWarn("%s:", cBold(stepName))
 
-		// Parse JSON log lines and extract messages
-		for _, line := range strings.Split(content, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var logEntry struct {
+		var messages []string
+		hasFailed := false
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var entry struct {
 				Message string `json:"message"`
 			}
-			if json.Unmarshal([]byte(line), &logEntry) == nil && logEntry.Message != "" {
-				fmt.Fprintln(os.Stderr, logEntry.Message)
+			if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Message != "" {
+				messages = append(messages, entry.Message)
+				if strings.Contains(entry.Message, "failed") {
+					hasFailed = true
+				}
+			}
+		}
+		f.Close()
+
+		if hasFailed {
+			stepName := strings.TrimSuffix(filepath.Base(path), ".log")
+			fmt.Fprintln(os.Stderr)
+			logWarn("%s:", cBold(stepName))
+			for _, msg := range messages {
+				fmt.Fprintln(os.Stderr, msg)
 			}
 		}
 	}
