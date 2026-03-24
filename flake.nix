@@ -10,12 +10,17 @@
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       perSystem = { pkgs, ... }: {
-        packages.default = pkgs.writeShellApplication {
-          name = "giton";
+        packages.default = pkgs.buildGoModule {
+          pname = "giton";
+          version = "0.1.0";
+          src = ./.;
+          vendorHash = null;
           meta.description = "Local CI tool — run commands on Nix platforms with GitHub status reporting";
-          runtimeInputs = [ pkgs.git pkgs.gh pkgs.nix pkgs.jq pkgs.openssh pkgs.process-compose ];
-          excludeShellChecks = [ "SC2029" "SC2317" "SC2329" ];
-          text = builtins.readFile ./giton;
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          postInstall = ''
+            wrapProgram $out/bin/giton \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.gh pkgs.nix pkgs.openssh pkgs.process-compose ]}
+          '';
         };
       };
     };
