@@ -116,10 +116,10 @@ Then in your project's `CLAUDE.md`, tell the agent how to use it:
 ```markdown
 # Dev workflow
 
-Use the localci MCP tools (`mcp__localci__build`, `mcp__localci__test`) — never run `nix build` or `go build` directly.
+Use the localci MCP tools (mcp__localci__<step>) — never run build or test commands directly.
 
 1. Make changes, commit
-2. Run localci MCP tools to verify (these use `--no-signoff` mode internally during iteration)
+2. Run localci MCP tools to verify
 3. If failures: fix, amend commit, re-run MCP tools
 4. Once green: push, then run localci MCP tools again to post GitHub statuses
 ```
