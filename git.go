@@ -15,11 +15,11 @@ func isInGitRepo() bool {
 }
 
 func isTreeClean() bool {
-	// Check staged changes
+	// Check unstaged changes
 	if err := exec.Command("git", "diff", "--quiet").Run(); err != nil {
 		return false
 	}
-	// Check unstaged changes
+	// Check staged changes
 	if err := exec.Command("git", "diff", "--cached", "--quiet").Run(); err != nil {
 		return false
 	}

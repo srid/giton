@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -58,14 +59,13 @@ type processEntry struct {
 }
 
 func runMultiStep(args cliArgs, sha string) int {
-	if _, err := os.Stat(args.configFile); os.IsNotExist(err) {
-		logErr("Config file not found: %s", args.configFile)
-		return 1
-	}
-
 	data, err := os.ReadFile(args.configFile)
 	if err != nil {
-		logErr("Failed to read config: %v", err)
+		if os.IsNotExist(err) {
+			logErr("Config file not found: %s", args.configFile)
+		} else {
+			logErr("Failed to read config: %v", err)
+		}
 		return 1
 	}
 
@@ -75,7 +75,7 @@ func runMultiStep(args cliArgs, sha string) int {
 		return 1
 	}
 
-	logMsg("Multi-step mode: %s%s%s  %sSHA=%s%s", bold, args.configFile, reset, dim, sha[:min(12, len(sha))], reset)
+	logMsg("Multi-step mode: %s%s%s  %sSHA=%s%s", bold, args.configFile, reset, dim, shortSHA(sha), reset)
 
 	currentSystem := getCurrentSystem()
 	cwd, _ := os.Getwd()
@@ -100,7 +100,7 @@ func runMultiStep(args cliArgs, sha string) int {
 	}
 
 	// Pre-extract repo once per system
-	workdirBase := fmt.Sprintf("/tmp/giton-%s", sha[:min(12, len(sha))])
+	workdirBase := fmt.Sprintf("/tmp/giton-%s", shortSHA(sha))
 	workdirMap := make(map[string]string)
 
 	// Local
@@ -126,7 +126,7 @@ func runMultiStep(args cliArgs, sha string) int {
 		}
 	}
 
-	logDir := fmt.Sprintf("/tmp/giton-%s-logs", sha[:min(12, len(sha))])
+	logDir := fmt.Sprintf("/tmp/giton-%s-logs", shortSHA(sha))
 	os.MkdirAll(logDir, 0o755)
 
 	// Build process entries (step × system matrix)
@@ -171,21 +171,11 @@ func runMultiStep(args cliArgs, sha string) int {
 	}()
 
 	// Run process-compose
-	tuiStr := "false"
-	if args.tui {
-		tuiStr = "true"
-	}
-	pcCmd := exec.Command("process-compose", "up", "--tui="+tuiStr, "--no-server", "--config", pcFile.Name())
+	pcCmd := exec.Command("process-compose", "up",
+		"--tui="+strconv.FormatBool(args.tui), "--no-server", "--config", pcFile.Name())
 	pcCmd.Stdout = os.Stdout
 	pcCmd.Stderr = os.Stderr
-	pcExit := 0
-	if err := pcCmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			pcExit = exitErr.ExitCode()
-		} else {
-			pcExit = 1
-		}
-	}
+	pcExit := exitCode(pcCmd.Run())
 
 	// Print summary
 	fmt.Fprintln(os.Stderr)

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 )
 
 var (
@@ -60,12 +61,13 @@ func logWarn(msg string, args ...any) {
 	fmt.Fprintf(os.Stderr, "%s%s==>%s %s\n", yellow, bold, reset, s)
 }
 
-func fmtDuration(seconds int) string {
-	if seconds >= 3600 {
-		return fmt.Sprintf("%dh%02dm%02ds", seconds/3600, (seconds%3600)/60, seconds%60)
+func fmtDuration(d time.Duration) string {
+	s := int(d.Seconds())
+	if s >= 3600 {
+		return fmt.Sprintf("%dh%02dm%02ds", s/3600, (s%3600)/60, s%60)
 	}
-	if seconds >= 60 {
-		return fmt.Sprintf("%dm%02ds", seconds/60, seconds%60)
+	if s >= 60 {
+		return fmt.Sprintf("%dm%02ds", s/60, s%60)
 	}
-	return fmt.Sprintf("%ds", seconds)
+	return fmt.Sprintf("%ds", s)
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-
 )
 
 func main() {
@@ -54,51 +53,40 @@ type cliArgs struct {
 	workdir        string
 }
 
+// requireArg returns the next argument or exits with an error.
+func requireArg(args []string, i int, flag string) string {
+	if i >= len(args) {
+		logErr("Missing value for %s", flag)
+		os.Exit(1)
+	}
+	return args[i]
+}
+
 func parseArgs(args []string) cliArgs {
 	var a cliArgs
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-s", "--system":
 			i++
-			if i >= len(args) {
-				logErr("Missing value for %s", args[i-1])
-				os.Exit(1)
-			}
-			a.system = args[i]
+			a.system = requireArg(args, i, args[i-1])
 			a.systemExplicit = true
 		case "-n", "--name":
 			i++
-			if i >= len(args) {
-				logErr("Missing value for %s", args[i-1])
-				os.Exit(1)
-			}
-			a.name = args[i]
+			a.name = requireArg(args, i, args[i-1])
 		case "--sha":
 			i++
-			if i >= len(args) {
-				logErr("Missing value for --sha")
-				os.Exit(1)
-			}
-			a.shaPin = args[i]
+			a.shaPin = requireArg(args, i, "--sha")
 		case "-f", "--file":
 			i++
-			if i >= len(args) {
-				logErr("Missing value for %s", args[i-1])
-				os.Exit(1)
-			}
-			a.configFile = args[i]
+			a.configFile = requireArg(args, i, args[i-1])
 		case "--tui":
 			a.tui = true
 		case "--workdir":
 			i++
-			if i >= len(args) {
-				logErr("Missing value for --workdir")
-				os.Exit(1)
-			}
-			a.workdir = args[i]
+			a.workdir = requireArg(args, i, "--workdir")
 		case "-h", "--help":
 			printUsage()
-			os.Exit(1)
+			os.Exit(0)
 		case "--":
 			a.cmd = args[i+1:]
 			return a
@@ -131,4 +119,3 @@ Common options:
 
 Status context: giton/<name> (no --system) or giton/<name>/<system> (with --system)`)
 }
-

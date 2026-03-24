@@ -10,13 +10,11 @@ import (
 )
 
 func runSingleStep(args cliArgs, sha string) int {
-	// Default --name to first word of command
 	name := args.name
 	if name == "" {
 		name = filepath.Base(args.cmd[0])
 	}
 
-	// Build context
 	var context string
 	if args.systemExplicit {
 		context = fmt.Sprintf("giton/%s/%s", name, args.system)
@@ -30,47 +28,37 @@ func runSingleStep(args cliArgs, sha string) int {
 		return 1
 	}
 
-	logMsg("%s%s%s  %s%s@%s%s", bold, context, reset, dim, repo, sha[:min(12, len(sha))], reset)
+	logMsg("%s%s%s  %s%s@%s%s", bold, context, reset, dim, repo, shortSHA(sha), reset)
 	logInfo("%s", strings.Join(args.cmd, " "))
 
-	// Post pending status
 	postStatus(repo, sha, "pending", context, "Running: "+strings.Join(args.cmd, " "))
 
-	// Determine if we need remote execution
-	remote := false
-	if args.systemExplicit {
-		currentSystem := getCurrentSystem()
-		if currentSystem != args.system {
-			remote = true
-		}
-	}
+	remote := args.systemExplicit && getCurrentSystem() != args.system
 
 	start := time.Now()
-	var exitCode int
+	var rc int
 
 	if args.workdir != "" {
-		// Pre-extracted workdir provided (multi-step mode)
+		// Pre-extracted workdir (multi-step mode)
 		if remote {
 			host, err := getRemoteHost(args.system)
 			if err != nil {
 				logErr("%v", err)
 				return 1
 			}
-			exitCode = runSSH(host, args.workdir, args.cmd)
+			rc = runSSH(host, args.workdir, args.cmd)
 		} else {
-			exitCode = runLocal(args.workdir, args.cmd)
+			rc = runLocal(args.workdir, args.cmd)
 		}
 	} else if remote {
-		// Remote execution
 		host, err := getRemoteHost(args.system)
 		if err != nil {
 			logErr("%v", err)
 			return 1
 		}
-		remoteDir := fmt.Sprintf("/tmp/giton-%s", sha[:min(12, len(sha))])
+		remoteDir := fmt.Sprintf("/tmp/giton-%s", shortSHA(sha))
 		defer cleanupRemote(host, remoteDir)
 
-		// Ensure SSH ControlMaster socket directory exists
 		ensureSSHControlDir(host)
 
 		logMsg("Copying repo to %s%s%s...", bold, host, reset)
@@ -79,10 +67,9 @@ func runSingleStep(args cliArgs, sha string) int {
 			return 1
 		}
 
-		exitCode = runSSH(host, remoteDir, args.cmd)
+		rc = runSSH(host, remoteDir, args.cmd)
 	} else {
-		// Local execution
-		tmpdir, err := os.MkdirTemp("", fmt.Sprintf("giton-%s-", sha[:min(12, len(sha))]))
+		tmpdir, err := os.MkdirTemp("", fmt.Sprintf("giton-%s-", shortSHA(sha)))
 		if err != nil {
 			logErr("Failed to create temp dir: %v", err)
 			return 1
@@ -95,35 +82,30 @@ func runSingleStep(args cliArgs, sha string) int {
 			return 1
 		}
 
-		exitCode = runLocal(tmpdir, args.cmd)
+		rc = runLocal(tmpdir, args.cmd)
 	}
 
-	elapsed := fmtDuration(int(time.Since(start).Seconds()))
+	elapsed := fmtDuration(time.Since(start))
 	cmdStr := strings.Join(args.cmd, " ")
 
-	if exitCode == 0 {
+	if rc == 0 {
 		logOk("%s%s%s passed in %s%s%s", bold, context, reset, green, elapsed, reset)
 		postStatus(repo, sha, "success", context, fmt.Sprintf("Passed in %s: %s", elapsed, cmdStr))
 	} else {
-		logWarn("%s%s%s failed (exit %d) in %s%s%s", bold, context, reset, exitCode, yellow, elapsed, reset)
-		postStatus(repo, sha, "failure", context, fmt.Sprintf("Failed (exit %d) in %s: %s", exitCode, elapsed, cmdStr))
+		logWarn("%s%s%s failed (exit %d) in %s%s%s", bold, context, reset, rc, yellow, elapsed, reset)
+		postStatus(repo, sha, "failure", context, fmt.Sprintf("Failed (exit %d) in %s: %s", rc, elapsed, cmdStr))
 	}
 
-	return exitCode
+	return rc
 }
 
 // runLocal executes a command locally in the given directory.
 func runLocal(dir string, cmdArgs []string) int {
-	cmd := exec.Command("bash", "-c", "cd '"+dir+"' && "+shellJoin(cmdArgs))
+	cmd := exec.Command("bash", "-c", strings.Join(cmdArgs, " "))
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode()
-		}
-		return 1
-	}
-	return 0
+	return exitCode(cmd.Run())
 }
 
 // runSSH executes a command on a remote host via SSH.
@@ -131,13 +113,18 @@ func runSSH(host, dir string, cmdArgs []string) int {
 	cmd := exec.Command("ssh", host, fmt.Sprintf("cd '%s' && %s", dir, strings.Join(cmdArgs, " ")))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode()
-		}
-		return 1
+	return exitCode(cmd.Run())
+}
+
+// exitCode extracts the process exit code from an exec error.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
 	}
-	return 0
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr.ExitCode()
+	}
+	return 1
 }
 
 func cleanupRemote(host, dir string) {
@@ -167,7 +154,9 @@ func getCurrentSystem() string {
 	return string(out)
 }
 
-// shellJoin quotes arguments for shell execution.
-func shellJoin(args []string) string {
-	return strings.Join(args, " ")
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
