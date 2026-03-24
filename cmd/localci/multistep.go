@@ -9,6 +9,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/fatih/color"
+	"github.com/rodaine/table"
 )
 
 // StepConfig represents a step in the multi-step config file (localci.json).
@@ -235,10 +238,10 @@ func runMultiStep(args cliArgs, sha string) int {
 			logOk("All steps passed")
 		} else {
 			logWarn("One or more steps failed (exit %d)", pcExit)
-			logInfo("Logs: %s/", logDir)
 			if !args.tui {
-				printFailedLogs(logDir)
+				printStepReport(logDir)
 			}
+			logInfo("Full logs: %s/", logDir)
 		}
 	}
 
@@ -406,26 +409,79 @@ func mustHostname() string {
 	return h
 }
 
-// printFailedLogs reads process-compose JSON log files and prints
-// messages from steps that contain "failed". Only used in non-TUI mode
-// to surface errors after process-compose exits.
-func printFailedLogs(logDir string) {
+// stepLog holds parsed info from a process-compose log file.
+type stepLog struct {
+	name     string
+	failed   bool
+	messages []string
+}
+
+// parseStepLogs reads all log files and extracts step status and messages.
+func parseStepLogs(logDir string) []stepLog {
 	paths, _ := filepath.Glob(filepath.Join(logDir, "*.log"))
+	var logs []stepLog
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
-		if err != nil || len(data) == 0 || !strings.Contains(string(data), "failed") {
+		if err != nil || len(data) == 0 {
 			continue
 		}
-		stepName := strings.TrimSuffix(filepath.Base(path), ".log")
-		fmt.Fprintln(os.Stderr)
-		logWarn("%s:", cBold(stepName))
+		sl := stepLog{name: strings.TrimSuffix(filepath.Base(path), ".log")}
 		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			var entry struct {
 				Message string `json:"message"`
 			}
 			if json.Unmarshal([]byte(line), &entry) == nil && entry.Message != "" {
-				fmt.Fprintln(os.Stderr, entry.Message)
+				sl.messages = append(sl.messages, entry.Message)
+				if strings.Contains(entry.Message, "failed") {
+					sl.failed = true
+				}
 			}
+		}
+		logs = append(logs, sl)
+	}
+	return logs
+}
+
+// printStepReport prints a summary table of step results and the tail
+// of output for failed steps.
+func printStepReport(logDir string) {
+	logs := parseStepLogs(logDir)
+	if len(logs) == 0 {
+		return
+	}
+
+	// Summary table
+	headerFmt := color.New(color.FgWhite, color.Bold).SprintfFunc()
+	passFmt := color.New(color.FgGreen).SprintfFunc()
+	failFmt := color.New(color.FgRed, color.Bold).SprintfFunc()
+
+	tbl := table.New("Step", "Status")
+	tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
+	for _, sl := range logs {
+		if sl.failed {
+			tbl.AddRow(sl.name, failFmt("FAIL"))
+		} else {
+			tbl.AddRow(sl.name, passFmt("pass"))
+		}
+	}
+	fmt.Fprintln(os.Stderr)
+	tbl.Print()
+
+	// Tail of failed step output
+	const tailLines = 20
+	for _, sl := range logs {
+		if !sl.failed {
+			continue
+		}
+		fmt.Fprintln(os.Stderr)
+		logWarn("%s:", cBold(sl.name))
+		start := 0
+		if len(sl.messages) > tailLines {
+			start = len(sl.messages) - tailLines
+			logInfo("... (%d lines omitted)", start)
+		}
+		for _, msg := range sl.messages[start:] {
+			fmt.Fprintf(os.Stderr, "    %s\n", msg)
 		}
 	}
 }

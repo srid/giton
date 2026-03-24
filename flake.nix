@@ -15,7 +15,7 @@
             pname = "localci";
             version = "0.1.0";
             src = ./.;
-            vendorHash = "sha256-0rbdfZLARlCeyUXRGWUZ/g36S1YV9tAyCm6eupGloEE=";
+            vendorHash = "sha256-6B/Q8Byws0F6zMBbrvPrL7TcjVSAXCXnEIz5ODTmyQ4=";
             subPackages = [ "cmd/localci" ];
             meta.description = "Local CI tool — run commands on Nix platforms with GitHub status reporting";
           };
