@@ -1,12 +1,14 @@
 # giton
 
-Local CI for Nix projects. Run `nix build` on your laptop and the result shows up as a green check on the GitHub PR — no hosted runner needed.
+Local CI from your terminal. Run any command and the result shows up as a green check on the GitHub PR — no hosted runner needed.
 
 ```bash
-nix run github:srid/giton -- -- nix build
+nix run github:srid/giton -- -- make build
 ```
 
 giton extracts the repo at HEAD into a temp directory (via `git archive`), runs the command there, and posts a GitHub commit status. The clean extraction means your uncommitted changes can't leak into the build. The working tree must be clean, or giton refuses to run.
+
+With `-s`, giton can target remote Nix systems over SSH — run builds on `aarch64-darwin` from your Linux box.
 
 <img width="1220" height="1010" alt="image" src="https://github.com/user-attachments/assets/2c687668-5f08-425c-922a-7595b2bef5b0" />
 
