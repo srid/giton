@@ -111,11 +111,17 @@ Add two files to your project root:
 }
 ```
 
-Then in your project's `CLAUDE.md`, tell the agent to use it:
+Then in your project's `CLAUDE.md`, tell the agent how to use it:
 
 ```markdown
-# CI
-Run CI via the localci MCP tools after making changes. If a step fails, fix the code and re-invoke.
+# Dev workflow
+
+Use the localci MCP tools (`mcp__localci__build`, `mcp__localci__test`) — never run `nix build` or `go build` directly.
+
+1. Make changes, commit
+2. Run localci MCP tools to verify (these use `--no-signoff` mode internally during iteration)
+3. If failures: fix, amend commit, re-run MCP tools
+4. Once green: push, then run localci MCP tools again to post GitHub statuses
 ```
 
 Each step from `localci.json` appears as an MCP tool (named `mcp__localci__<step>`). Dependencies are respected — invoking a step auto-starts its dependencies first. Steps can be re-invoked after fixing code. Step logs are exposed as MCP resources for diagnosis.
