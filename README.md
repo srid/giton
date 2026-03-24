@@ -25,6 +25,9 @@ On first use, localci prompts for the SSH hostname for that system. The mapping 
 
 The GitHub status context includes the system: `localci/build/aarch64-darwin`.
 
+> [!NOTE]
+> This approach runs the entire build on the remote machine via SSH, rather than using Nix remote builders. Remote builders frequently hang during builds, making them unreliable for CI. localci sidesteps this by treating the remote as a plain execution target.
+
 ## Multi-step
 
 For projects with multiple CI steps, define them in a JSON config:
