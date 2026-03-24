@@ -58,6 +58,9 @@ Under the hood, localci generates a [process-compose](https://github.com/F1bonac
 
 ## GitHub Actions
 
+> [!NOTE]
+> Running localci in GitHub Actions defeats the purpose of *local* CI — you're back to waiting for hosted runners. Consider using the [MCP integration](#agent-integration-mcp) with a coding agent instead. That said, nothing prevents you from using both.
+
 localci works in hosted CI too. Use `--sha` to pin to the PR commit (the clean-tree check doesn't apply in CI since there's no working tree to protect):
 
 ```yaml
