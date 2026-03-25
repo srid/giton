@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,7 +26,8 @@ func runMCPServer(args cliArgs) int {
 	cwd, _ := os.Getwd()
 
 	// Resolve and warm SSH connections upfront — tool handlers can't prompt.
-	if _, _, err := resolveHosts(config); err != nil {
+	hostMap, allSystems, err := resolveHosts(config)
+	if err != nil {
 		logErr("%v", err)
 		return 1
 	}
@@ -42,14 +42,17 @@ func runMCPServer(args cliArgs) int {
 
 	s := server.NewMCPServer("localci", "0.1.0")
 
-	// "run-all" tool: runs the entire DAG with parallelization
+	// "run-all" tool: runs the entire DAG with parallelization in-process
 	runAllTool := mcp.NewTool("run-all",
 		mcp.WithDescription("Run all CI steps in parallel (respecting dependencies)"),
 		mcp.WithString("sha",
 			mcp.Description("Git ref to test (default: HEAD)"),
 		),
 	)
-	s.AddTool(runAllTool, makeRunAllHandler(self, cwd, args.configFile, args.noSignoff))
+	s.AddTool(runAllTool, makeRunAllHandler(
+		procs, config, self, cwd,
+		hostMap, allSystems, args.noSignoff,
+	))
 
 	// Individual step tools for targeted runs
 	for _, p := range procs {
@@ -79,7 +82,45 @@ func runMCPServer(args cliArgs) int {
 	return 0
 }
 
-func makeRunAllHandler(self, cwd, configFile string, noSignoff bool) server.ToolHandlerFunc {
+// mcpObserver sends structured MCP log notifications on DAG events.
+type mcpObserver struct {
+	ctx context.Context
+	srv *server.MCPServer
+}
+
+func (m *mcpObserver) onStateChange(key string, s stepState) {
+	if m.srv == nil {
+		return
+	}
+	var msg string
+	switch s {
+	case stateRunning:
+		msg = fmt.Sprintf("▶ %s: running", key)
+	case stateDone:
+		msg = fmt.Sprintf("✓ %s: passed", key)
+	case stateFailed:
+		msg = fmt.Sprintf("✗ %s: failed", key)
+	case stateSkipped:
+		msg = fmt.Sprintf("⊘ %s: skipped (dependency failed)", key)
+	default:
+		return
+	}
+	m.srv.SendNotificationToClient(m.ctx, "notifications/message", map[string]any{
+		"level": "info",
+		"data":  msg,
+	})
+}
+
+func (m *mcpObserver) onOutput(key string, line string) {
+	// Don't spam every line — agent gets the full output in the result
+}
+
+func makeRunAllHandler(
+	procs []processEntry, config MultiStepConfig,
+	self, cwd string,
+	hostMap map[string]string, allSystems []string,
+	noSignoff bool,
+) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sha := request.GetString("sha", "HEAD")
 
@@ -88,59 +129,85 @@ func makeRunAllHandler(self, cwd, configFile string, noSignoff bool) server.Tool
 			sha = resolved
 		}
 
-		cmdParts := []string{self, "--sha", sha, "-f", configFile}
-		if noSignoff {
-			cmdParts = append(cmdParts, "--no-signoff")
+		currentSystem := getCurrentSystem()
+
+		// Extract repo per system
+		workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
+		workdirMap := make(map[string]string)
+
+		localDir := workdirBase + "-local"
+		if err := extractRepoLocal(sha, localDir); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("extract failed: %v", err)), nil
 		}
+		workdirMap[currentSystem] = localDir
 
-		// Use os.Pipe so we can stream progress notifications to the client
-		pr, pw, err := os.Pipe()
-		if err != nil {
-			return mcp.NewToolResultError("failed to create pipe"), nil
-		}
-
-		cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
-		cmd.Dir = cwd
-		cmd.Stdout = pw
-		cmd.Stderr = pw
-
-		if err := cmd.Start(); err != nil {
-			pw.Close()
-			pr.Close()
-			return mcp.NewToolResultError(fmt.Sprintf("failed to start: %v", err)), nil
-		}
-		pw.Close()
-
-		srv := server.ServerFromContext(ctx)
-		var output strings.Builder
-		scanner := bufio.NewScanner(pr)
-		scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			output.WriteString(line)
-			output.WriteByte('\n')
-
-			// Send progress notifications for key events
-			if srv != nil && (strings.Contains(line, "passed") ||
-				strings.Contains(line, "failed") ||
-				strings.Contains(line, "Running") ||
-				strings.Contains(line, "Skipped") ||
-				strings.Contains(line, "All steps")) {
-				srv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
-					"level": "info",
-					"data":  line,
-				})
+		for _, sys := range allSystems {
+			if sys != currentSystem {
+				host := hostMap[sys]
+				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
+				if err := extractRepoRemote(sha, host, rdir); err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("remote extract failed: %v", err)), nil
+				}
+				workdirMap[sys] = rdir
 			}
 		}
-		pr.Close()
 
-		rc := exitCode(cmd.Wait())
-		result := truncateOutput(output.String(), 200)
+		logDir := fmt.Sprintf("/tmp/localci-%s-logs", shortSHA(sha))
+		os.RemoveAll(logDir)
+		os.MkdirAll(logDir, 0o755)
+		writeManifest(logDir, procs)
+
+		obs := &mcpObserver{
+			ctx: ctx,
+			srv: server.ServerFromContext(ctx),
+		}
+
+		rc := runDAG(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, noSignoff, obs)
+
+		// Build structured result from step logs
+		results := loadStepResults(logDir)
+		var output strings.Builder
+		for _, r := range results {
+			label := r.step
+			if r.system != "" {
+				label += " (" + r.system + ")"
+			}
+			if r.failed {
+				fmt.Fprintf(&output, "✗ %s: FAILED\n", label)
+			} else if len(r.messages) == 0 {
+				fmt.Fprintf(&output, "⊘ %s: skipped\n", label)
+			} else {
+				fmt.Fprintf(&output, "✓ %s: passed\n", label)
+			}
+			// Include tail of output for failed steps
+			if r.failed {
+				start := 0
+				if len(r.messages) > 20 {
+					start = len(r.messages) - 20
+				}
+				for _, msg := range r.messages[start:] {
+					fmt.Fprintf(&output, "  %s\n", msg)
+				}
+			}
+		}
+
+		// Cleanup
+		if rc == 0 {
+			os.RemoveAll(logDir)
+		}
+		os.RemoveAll(localDir)
+		for _, sys := range allSystems {
+			if sys != currentSystem {
+				host := hostMap[sys]
+				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
+				exec.Command("ssh", host, "rm -rf '"+rdir+"'").Run()
+			}
+		}
 
 		if rc != 0 {
-			return mcp.NewToolResultText(fmt.Sprintf("FAILED (exit %d)\n\n%s", rc, result)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("FAILED (exit %d)\n\n%s", rc, output.String())), nil
 		}
-		return mcp.NewToolResultText(result), nil
+		return mcp.NewToolResultText(output.String()), nil
 	}
 }
 
@@ -152,7 +219,6 @@ func makeStepHandler(
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sha := request.GetString("sha", "HEAD")
 
-		// Resolve ref to full SHA
 		resolved, err := resolveRef(sha)
 		if err == nil {
 			sha = resolved

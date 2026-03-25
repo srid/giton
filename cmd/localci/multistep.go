@@ -134,8 +134,11 @@ func runMultiStep(args cliArgs, sha string) int {
 		return 1
 	}
 
+	tobs := newTerminalObserver(procs)
+
 	// Run DAG executor
-	exitCode := runDAG(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, args.noSignoff)
+	exitCode := runDAG(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, args.noSignoff, tobs)
+	tobs.done()
 
 	// Cleanup
 	if exitCode == 0 {
@@ -287,14 +290,62 @@ func (sb *statusBar) clear() {
 	fmt.Fprintf(os.Stderr, "\033[r\033[%d;1H\033[2K", sb.height)
 }
 
+// dagObserver receives structured events from the DAG executor.
+// Implementations handle terminal output vs MCP notifications vs testing.
+type dagObserver interface {
+	onStateChange(key string, s stepState)
+	onOutput(key string, line string)
+}
+
+// terminalObserver streams prefixed output to stderr with a sticky status bar.
+type terminalObserver struct {
+	sb       *statusBar
+	pf       prefixFormatter
+	prefixes map[string]string // pre-computed formatted prefixes
+	mu       sync.Mutex
+}
+
+func newTerminalObserver(procs []processEntry) *terminalObserver {
+	state := make(map[string]stepState)
+	for _, p := range procs {
+		state[p.key] = stateWaiting
+	}
+	pf := newPrefixFormatter(procs)
+	prefixes := make(map[string]string)
+	for _, p := range procs {
+		prefixes[p.key] = pf.format(p)
+	}
+	return &terminalObserver{
+		sb:       newStatusBar(procs, state),
+		pf:       pf,
+		prefixes: prefixes,
+	}
+}
+
+func (t *terminalObserver) onStateChange(key string, s stepState) {
+	// DAG mutex is held by caller; update status bar's state and render
+	t.sb.state[key] = s
+	t.sb.render()
+}
+
+func (t *terminalObserver) onOutput(key string, line string) {
+	t.mu.Lock()
+	fmt.Fprintf(os.Stderr, "%s %s\n", t.prefixes[key], line)
+	t.mu.Unlock()
+}
+
+func (t *terminalObserver) done() {
+	t.sb.clear()
+}
+
 // runDAG executes steps respecting dependencies. Independent steps run
 // concurrently via goroutines. If a step fails, its dependents are skipped.
-// Output is streamed line-by-line with colored [step] [system] prefixes.
 func runDAG(
 	procs []processEntry, config MultiStepConfig,
 	sha, self, cwd, logDir string,
 	hostMap, workdirMap map[string]string,
 	noSignoff bool,
+	obs dagObserver,
 ) int {
 	depMap := buildDepMap(procs, config)
 
@@ -303,9 +354,6 @@ func runDAG(
 	for _, p := range procs {
 		state[p.key] = stateWaiting
 	}
-
-	sb := newStatusBar(procs, state)
-	pf := newPrefixFormatter(procs)
 
 	var wg sync.WaitGroup
 	hasFailure := false
@@ -321,8 +369,7 @@ func runDAG(
 			switch state[dep] {
 			case stateFailed, stateSkipped:
 				state[p.key] = stateSkipped
-				sb.render()
-				// Cascade: skip anything that depends on this
+				obs.onStateChange(p.key, stateSkipped)
 				for _, pp := range procs {
 					tryLaunch(pp)
 				}
@@ -333,22 +380,20 @@ func runDAG(
 		}
 
 		state[p.key] = stateRunning
-		sb.render()
+		obs.onStateChange(p.key, stateRunning)
 		wg.Add(1)
 		go func(p processEntry) {
 			defer wg.Done()
 
 			step := config.Steps[p.step]
 			cmdParts := buildStepCmd(self, sha, p, step, workdirMap, noSignoff)
-			prefix := pf.format(p)
 
-			// Use os.Pipe so the kernel merges stdout+stderr atomically
-			// (io.Pipe with two Go copier goroutines can interleave bytes)
 			pr, pw, err := os.Pipe()
 			if err != nil {
 				mu.Lock()
 				state[p.key] = stateFailed
 				hasFailure = true
+				obs.onStateChange(p.key, stateFailed)
 				mu.Unlock()
 				return
 			}
@@ -364,10 +409,10 @@ func runDAG(
 				mu.Lock()
 				state[p.key] = stateFailed
 				hasFailure = true
+				obs.onStateChange(p.key, stateFailed)
 				mu.Unlock()
 				return
 			}
-			// Close write end in parent so reads get EOF when child exits
 			pw.Close()
 
 			logFile := filepath.Join(logDir, sanitizeLogName(p.key)+".log")
@@ -377,9 +422,7 @@ func runDAG(
 			scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
 			for scanner.Scan() {
 				line := scanner.Text()
-				mu.Lock()
-				fmt.Fprintf(os.Stderr, "%s %s\n", prefix, line)
-				mu.Unlock()
+				obs.onOutput(p.key, line)
 				if logF != nil {
 					fmt.Fprintln(logF, line)
 				}
@@ -398,7 +441,7 @@ func runDAG(
 				state[p.key] = stateFailed
 				hasFailure = true
 			}
-			sb.render()
+			obs.onStateChange(p.key, state[p.key])
 			for _, pp := range procs {
 				tryLaunch(pp)
 			}
@@ -413,7 +456,6 @@ func runDAG(
 	mu.Unlock()
 
 	wg.Wait()
-	sb.clear()
 
 	if hasFailure {
 		return 1
