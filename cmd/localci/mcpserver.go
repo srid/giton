@@ -60,7 +60,7 @@ func runMCPServer(args cliArgs) int {
 				mcp.Description("Git ref to test (default: HEAD)"),
 			),
 		)
-		s.AddTool(tool, makeStepHandler(p, step, self, cwd, args.noSignoff))
+		s.AddTool(tool, makeStepHandler(p, step, self, cwd))
 	}
 
 	// Dependency graph resource (structured JSON for programmatic access)
@@ -82,7 +82,6 @@ func runMCPServer(args cliArgs) int {
 func makeStepHandler(
 	p processEntry, step StepConfig,
 	self, cwd string,
-	noSignoff bool,
 ) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sha := request.GetString("sha", "HEAD")
@@ -93,7 +92,7 @@ func makeStepHandler(
 		}
 
 		cmdParts := []string{self, "--sha", sha}
-		if noSignoff {
+		if !isCommitPushed(sha) {
 			cmdParts = append(cmdParts, "--no-signoff")
 		}
 		if p.sys != "" {

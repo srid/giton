@@ -38,6 +38,15 @@ func resolveRef(ref string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// isCommitPushed checks if a SHA exists on any remote branch.
+func isCommitPushed(sha string) bool {
+	out, err := exec.Command("git", "branch", "-r", "--contains", sha).Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
+}
+
 // extractRepoLocal extracts the repo at the given SHA to a local directory.
 func extractRepoLocal(sha, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
