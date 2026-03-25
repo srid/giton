@@ -135,7 +135,9 @@ func (jt *jobTracker) complete(key string, r jobResult) {
 	}
 }
 
-// pollAll returns a compact single-line status string.
+// pollAll returns a compact single-line status string for the agent.
+// Symbols: · not started, ◌ queued (waiting for deps), ● running, ✓ passed, ✗ failed.
+// When all steps are done, failed step output is appended.
 func (jt *jobTracker) pollAll(keys []string) string {
 	jt.mu.Lock()
 	defer jt.mu.Unlock()

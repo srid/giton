@@ -187,10 +187,7 @@ func runMultiStep(args cliArgs, sha string) int {
 	exitCode := runDAG(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, args.noSignoff, tobs)
 	tobs.done()
 
-	// Cleanup
-	if exitCode == 0 {
-		os.RemoveAll(logDir)
-	}
+	// Cleanup extracted repos (local and remote)
 	os.RemoveAll(localDir)
 	for _, sys := range allSystems {
 		if sys != currentSystem {
@@ -200,8 +197,10 @@ func runMultiStep(args cliArgs, sha string) int {
 		}
 	}
 
+	// Report results. Keep log dir on failure for debugging.
 	fmt.Fprintln(os.Stderr)
 	if exitCode == 0 {
+		os.RemoveAll(logDir)
 		logOk("All steps passed")
 	} else {
 		logWarn("One or more steps failed (exit %d)", exitCode)
@@ -338,39 +337,9 @@ func runDAG(
 			cmdParts = append(cmdParts, "-n", p.step, "--", step.Command)
 
 			logFile := filepath.Join(logDir, sanitizeLogName(p.key)+".log")
-
-			cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
-			cmd.Dir = cwd
-
 			prefix := pf.format(p)
 
-			pr, pw, _ := os.Pipe()
-			cmd.Stdout = pw
-			cmd.Stderr = pw
-
-			lf, _ := os.Create(logFile)
-
-			var streamWg sync.WaitGroup
-			streamWg.Add(1)
-			go func() {
-				defer streamWg.Done()
-				scanner := bufio.NewScanner(pr)
-				for scanner.Scan() {
-					line := scanner.Text()
-					if lf != nil {
-						fmt.Fprintf(lf, "%s\n", line)
-					}
-					tobs.writeLine(fmt.Sprintf("%s %s", prefix, line))
-				}
-			}()
-
-			rc := exitCode(cmd.Run())
-			pw.Close()
-			streamWg.Wait()
-			pr.Close()
-			if lf != nil {
-				lf.Close()
-			}
+			rc := runAndStream(cmdParts, cwd, logFile, prefix, tobs)
 
 			mu.Lock()
 			results[p.key] = rc
@@ -394,6 +363,43 @@ func runDAG(
 		}
 	}
 	return 0
+}
+
+// runAndStream executes a command, streaming its output line-by-line to both
+// a log file and the terminal observer (with a colored prefix). Returns the
+// process exit code.
+func runAndStream(cmdParts []string, dir, logFile, prefix string, tobs *terminalObserver) int {
+	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+	cmd.Dir = dir
+
+	pr, pw, _ := os.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	lf, _ := os.Create(logFile)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if lf != nil {
+				fmt.Fprintf(lf, "%s\n", line)
+			}
+			tobs.writeLine(fmt.Sprintf("%s %s", prefix, line))
+		}
+	}()
+
+	rc := exitCode(cmd.Run())
+	pw.Close()
+	wg.Wait()
+	pr.Close()
+	if lf != nil {
+		lf.Close()
+	}
+	return rc
 }
 
 // ── Terminal observer ──────────────────────────────────────────────────────
@@ -594,16 +600,20 @@ func loadStepResults(logDir string) []stepResult {
 		sr := stepResult{step: e.Step, system: e.System}
 		logData, err := os.ReadFile(e.LogFile)
 		if err != nil || len(logData) == 0 {
-			sr.failed = true // no log = didn't run or crashed
+			// No log file or empty = step didn't produce output (likely failed/skipped)
+			sr.failed = true
 			results = append(results, sr)
 			continue
 		}
 		lines := strings.Split(strings.TrimSpace(string(logData)), "\n")
 		sr.messages = lines
-		// Check last few lines for failure indicators
-		for _, line := range lines {
-			if strings.Contains(line, "failed") || strings.Contains(line, "FAIL") {
+
+		// Detect failure from localci's own status messages in the output.
+		// Single-step mode prints "failed" when exit code != 0.
+		for i := len(lines) - 1; i >= 0 && i >= len(lines)-5; i-- {
+			if strings.Contains(lines[i], "failed") {
 				sr.failed = true
+				break
 			}
 		}
 		results = append(results, sr)
@@ -621,6 +631,7 @@ func printStepReport(logDir string) {
 	passFmt := color.New(color.FgGreen).SprintfFunc()
 	failFmt := color.New(color.FgRed, color.Bold).SprintfFunc()
 
+	// Build table — include System column only when at least one step has one
 	hasSystems := false
 	for _, r := range results {
 		if r.system != "" {
@@ -630,30 +641,28 @@ func printStepReport(logDir string) {
 	}
 
 	fmt.Fprintln(os.Stderr)
+	var tbl table.Table
 	if hasSystems {
-		tbl := table.New("Step", "System", "Status")
-		tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
-		for _, r := range results {
-			status := passFmt("pass")
-			if r.failed {
-				status = failFmt("FAIL")
-			}
-			tbl.AddRow(r.step, r.system, status)
-		}
-		tbl.Print()
+		tbl = table.New("Step", "System", "Status")
 	} else {
-		tbl := table.New("Step", "Status")
-		tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
-		for _, r := range results {
-			status := passFmt("pass")
-			if r.failed {
-				status = failFmt("FAIL")
-			}
+		tbl = table.New("Step", "Status")
+	}
+	tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
+
+	for _, r := range results {
+		status := passFmt("pass")
+		if r.failed {
+			status = failFmt("FAIL")
+		}
+		if hasSystems {
+			tbl.AddRow(r.step, r.system, status)
+		} else {
 			tbl.AddRow(r.step, status)
 		}
-		tbl.Print()
 	}
+	tbl.Print()
 
+	// Show tail of output for failed steps
 	const tailLines = 20
 	for _, r := range results {
 		if !r.failed {
