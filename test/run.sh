@@ -27,13 +27,7 @@ exit 0
 MOCK
 chmod +x "$MOCK_BIN/gh"
 
-# Ensure process-compose is available
-if ! command -v process-compose &>/dev/null; then
-  PC_PATH=$(nix build nixpkgs#process-compose --print-out-paths --no-link 2>/dev/null)/bin
-  export PATH="$MOCK_BIN:$PC_PATH:$PATH"
-else
-  export PATH="$MOCK_BIN:$PATH"
-fi
+export PATH="$MOCK_BIN:$PATH"
 export GH_CALL_LOG="$WORK/gh-calls.log"
 
 # Test git repo

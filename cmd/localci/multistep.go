@@ -1,17 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 	"github.com/rodaine/table"
+	"golang.org/x/term"
 )
 
 // StepConfig represents a step in the multi-step config file (localci.json).
@@ -43,73 +47,36 @@ func loadConfig(path string) (MultiStepConfig, error) {
 	return config, nil
 }
 
-// Process-compose config types. We generate a JSON config file and hand it
-// to process-compose for parallel step orchestration with dependency ordering.
-type pcConfig struct {
-	Version          string               `json:"version"`
-	LogConfiguration pcLogConfig          `json:"log_configuration"`
-	MCPServer        *pcMCPServer         `json:"mcp_server,omitempty"`
-	Processes        map[string]pcProcess `json:"processes"`
-}
-
-type pcMCPServer struct {
-	Transport string `json:"transport"`
-}
-
-type pcLogConfig struct {
-	FlushEachLine bool `json:"flush_each_line"`
-}
-
-type pcProcess struct {
-	Command      string                    `json:"command"`
-	WorkingDir   string                    `json:"working_dir"`
-	LogLocation  string                    `json:"log_location"`
-	Namespace    string                    `json:"namespace,omitempty"`
-	Availability *pcAvailability           `json:"availability,omitempty"`
-	Shutdown     *pcShutdown               `json:"shutdown,omitempty"`
-	DependsOn    map[string]pcDependency   `json:"depends_on,omitempty"`
-	Disabled     bool                      `json:"disabled,omitempty"`
-	MCP          *pcMCP                    `json:"mcp,omitempty"`
-}
-
-// pcShutdown configures how process-compose terminates a process.
-// signal 9 (SIGKILL) ensures immediate termination — nix build and
-// similar tools often ignore SIGTERM, causing the TUI to hang on
-// "Terminating".
-type pcShutdown struct {
-	Signal int `json:"signal"`
-}
-
-type pcMCP struct {
-	Type      string        `json:"type"`
-	Arguments []pcMCPArg    `json:"arguments,omitempty"`
-}
-
-type pcMCPArg struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Description string `json:"description,omitempty"`
-	Required    bool   `json:"required"`
-}
-
-type pcAvailability struct {
-	Restart string `json:"restart"`
-}
-
-type pcDependency struct {
-	Condition string `json:"condition"`
-}
-
-// processEntry tracks a step×system combination and its process-compose key.
+// processEntry tracks a step×system combination and its unique key.
 type processEntry struct {
 	step string
 	sys  string // empty if no systems defined
-	key  string // process-compose process name
+	key  string // "step" or "step (system)"
+}
+
+// resolveHosts resolves and warms SSH connections for all remote systems.
+// Must happen upfront since subprocesses/tool handlers can't prompt.
+func resolveHosts(config MultiStepConfig) (hostMap map[string]string, allSystems []string, err error) {
+	currentSystem := getCurrentSystem()
+	allSystems = collectSystems(config)
+	hostMap = map[string]string{currentSystem: mustHostname()}
+	for _, sys := range allSystems {
+		if sys != currentSystem {
+			host, err := getRemoteHost(sys)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get host for %s: %w", sys, err)
+			}
+			hostMap[sys] = host
+			logMsg("Warming SSH connection to %s (%s)...", cBold(host), sys)
+			exec.Command("ssh", host, "echo", "ok").Run()
+		}
+	}
+	return hostMap, allSystems, nil
 }
 
 // runMultiStep reads a JSON config defining steps (with optional systems and
 // dependencies), resolves remote hosts, extracts the repo to each target,
-// generates a process-compose config, and runs all steps in parallel.
+// and runs all steps in parallel using a native DAG executor.
 // Each step self-invokes localci in single-step mode with --sha pinning.
 func runMultiStep(args cliArgs, sha string) int {
 	config, err := loadConfig(args.configFile)
@@ -123,140 +90,412 @@ func runMultiStep(args cliArgs, sha string) int {
 	currentSystem := getCurrentSystem()
 	cwd, _ := os.Getwd()
 
-	// Collect all unique systems from config
-	allSystems := collectSystems(config)
-
-	// Resolve remote hosts upfront — process-compose subprocesses can't
-	// prompt for hostnames, so we do it here while we still have a TTY.
-	hostMap := map[string]string{currentSystem: mustHostname()}
-	for _, sys := range allSystems {
-		if sys != currentSystem {
-			host, err := getRemoteHost(sys)
-			if err != nil {
-				logErr("Failed to get host for %s: %v", sys, err)
-				return 1
-			}
-			hostMap[sys] = host
-			// Warm SSH connection
-			logMsg("Warming SSH connection to %s (%s)...", cBold(host), sys)
-			exec.Command("ssh", host, "echo", "ok").Run()
-		}
+	hostMap, allSystems, err := resolveHosts(config)
+	if err != nil {
+		logErr("%v", err)
+		return 1
 	}
 
+	// Pre-extract repo once per system for efficiency
+	workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
 	workdirMap := make(map[string]string)
-	var localDir string
 
-	if args.mcp {
-		// MCP mode: skip pre-extraction. Each tool invocation resolves HEAD
-		// fresh and extracts its own archive. This ensures agents always run
-		// against the current commit, not a stale one from server startup.
-	} else {
-		// Normal mode: pre-extract repo once per system for efficiency
-		workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
+	localDir := workdirBase + "-local"
+	logMsg("Extracting repo (local)...")
+	if err := extractRepoLocal(sha, localDir); err != nil {
+		logErr("Failed to extract repo locally: %v", err)
+		return 1
+	}
+	workdirMap[currentSystem] = localDir
 
-		localDir = workdirBase + "-local"
-		logMsg("Extracting repo (local)...")
-		if err := extractRepoLocal(sha, localDir); err != nil {
-			logErr("Failed to extract repo locally: %v", err)
-			return 1
-		}
-		workdirMap[currentSystem] = localDir
-
-		for _, sys := range allSystems {
-			if sys != currentSystem {
-				host := hostMap[sys]
-				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
-				logMsg("Extracting repo on %s (%s)...", cBold(host), sys)
-				if err := extractRepoRemote(sha, host, rdir); err != nil {
-					logErr("Failed to extract repo on %s: %v", host, err)
-					return 1
-				}
-				workdirMap[sys] = rdir
+	for _, sys := range allSystems {
+		if sys != currentSystem {
+			host := hostMap[sys]
+			rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
+			logMsg("Extracting repo on %s (%s)...", cBold(host), sys)
+			if err := extractRepoRemote(sha, host, rdir); err != nil {
+				logErr("Failed to extract repo on %s: %v", host, err)
+				return 1
 			}
+			workdirMap[sys] = rdir
 		}
 	}
 
 	logDir := fmt.Sprintf("/tmp/localci-%s-logs", shortSHA(sha))
-	// Clean stale logs from previous runs at the same SHA
 	os.RemoveAll(logDir)
 	os.MkdirAll(logDir, 0o755)
 
-	// Build process entries (step × system matrix)
 	procs := buildProcessEntries(config)
-
-	// Write step manifest so the report knows step→system mapping
 	writeManifest(logDir, procs)
 
-	// Resolve self path
 	self, err := selfPathResolved()
 	if err != nil {
 		logErr("Could not resolve self path: %v", err)
 		return 1
 	}
 
-	// Generate process-compose config
-	pcCfg := generatePCConfig(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, args.mcp, args.noSignoff)
+	tobs := newTerminalObserver(procs)
 
-	// Write process-compose config to temp file
-	pcFile, err := os.CreateTemp("", "localci-pc-*.json")
-	if err != nil {
-		logErr("Failed to create temp file: %v", err)
-		return 1
-	}
-	defer os.Remove(pcFile.Name())
+	// Run DAG executor
+	exitCode := runDAG(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, args.noSignoff, tobs)
+	tobs.done()
 
-	enc := json.NewEncoder(pcFile)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(pcCfg); err != nil {
-		logErr("Failed to write process-compose config: %v", err)
-		return 1
-	}
-	pcFile.Close()
-
-	// Run process-compose
-	pcArgs := []string{"up", "--config", pcFile.Name()}
-	if args.mcp {
-		// MCP mode: stdio transport. --no-server disables the HTTP API
-		// (which would conflict on port 8080); MCP uses stdio instead.
-		pcArgs = append(pcArgs, "--tui=false", "--no-server")
-	} else {
-		pcArgs = append(pcArgs, "--tui="+strconv.FormatBool(args.tui), "--no-server")
-	}
-	pcCmd := exec.Command("process-compose", pcArgs...)
-	pcCmd.Stdout = os.Stdout
-	pcCmd.Stderr = os.Stderr
-	pcCmd.Stdin = os.Stdin
-	pcExit := exitCode(pcCmd.Run())
-
-	// Cleanup temp dirs. Keep log dir on failure for debugging.
-	if pcExit == 0 {
+	// Cleanup
+	if exitCode == 0 {
 		os.RemoveAll(logDir)
 	}
-	if !args.mcp {
-		workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
-		os.RemoveAll(localDir)
-		for _, sys := range allSystems {
-			if sys != currentSystem {
-				host := hostMap[sys]
-				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
-				exec.Command("ssh", host, "rm -rf '"+rdir+"'").Run()
+	os.RemoveAll(localDir)
+	for _, sys := range allSystems {
+		if sys != currentSystem {
+			host := hostMap[sys]
+			rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
+			exec.Command("ssh", host, "rm -rf '"+rdir+"'").Run()
+		}
+	}
+
+	fmt.Fprintln(os.Stderr)
+	if exitCode == 0 {
+		logOk("All steps passed")
+	} else {
+		logWarn("One or more steps failed (exit %d)", exitCode)
+		printStepReport(logDir)
+		logInfo("Full logs: %s/", logDir)
+	}
+
+	return exitCode
+}
+
+type stepState int
+
+const (
+	stateWaiting stepState = iota
+	stateRunning
+	stateDone
+	stateFailed
+	stateSkipped
+)
+
+// palette of distinct colors for step/system prefixes.
+var palette = []color.Attribute{
+	color.FgCyan,
+	color.FgMagenta,
+	color.FgBlue,
+	color.FgYellow,
+	color.FgGreen,
+	color.FgHiCyan,
+	color.FgHiMagenta,
+	color.FgHiBlue,
+}
+
+// colorFor returns a deterministic color for a name (consistent across runs).
+func colorFor(name string) *color.Color {
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	return color.New(palette[int(h.Sum32())%len(palette)])
+}
+
+// prefixFormatter builds aligned colored prefixes for a set of process entries.
+// Each step name and system name is padded to the max width in the set, so
+// output lines from different steps form neat columns.
+type prefixFormatter struct {
+	maxStep int
+	maxSys  int
+}
+
+func newPrefixFormatter(procs []processEntry) prefixFormatter {
+	var pf prefixFormatter
+	for _, p := range procs {
+		if len(p.step) > pf.maxStep {
+			pf.maxStep = len(p.step)
+		}
+		if len(p.sys) > pf.maxSys {
+			pf.maxSys = len(p.sys)
+		}
+	}
+	return pf
+}
+
+func (pf prefixFormatter) format(p processEntry) string {
+	stepC := colorFor(p.step)
+	padded := fmt.Sprintf("%-*s", pf.maxStep, p.step)
+	if pf.maxSys == 0 {
+		return stepC.Sprintf("[%s]", padded)
+	}
+	sysC := colorFor(p.sys)
+	sysPadded := fmt.Sprintf("%-*s", pf.maxSys, p.sys)
+	return stepC.Sprintf("[%s]", padded) + " " + sysC.Sprintf("[%s]", sysPadded)
+}
+
+// statusBar pins a one-line step summary at the bottom of the terminal
+// using ANSI scroll regions. The scroll region excludes the last row,
+// so normal output scrolls without overwriting the status line.
+type statusBar struct {
+	procs  []processEntry
+	state  map[string]stepState
+	height int  // terminal height; 0 = not a TTY
+}
+
+func newStatusBar(procs []processEntry, state map[string]stepState) *statusBar {
+	sb := &statusBar{procs: procs, state: state}
+	if !isatty.IsTerminal(os.Stderr.Fd()) {
+		return sb
+	}
+	_, h, err := term.GetSize(int(os.Stderr.Fd()))
+	if err != nil || h < 3 {
+		return sb
+	}
+	sb.height = h
+	// Reserve last row: set scroll region to rows 1..(height-1)
+	fmt.Fprintf(os.Stderr, "\033[1;%dr", sb.height-1)
+	sb.render()
+	return sb
+}
+
+// render redraws the status bar on the last row. Must be called with mu held.
+func (sb *statusBar) render() {
+	if sb.height == 0 {
+		return
+	}
+	var parts []string
+	for _, p := range sb.procs {
+		var symbol string
+		switch sb.state[p.key] {
+		case stateWaiting:
+			symbol = cDim("·")
+		case stateRunning:
+			symbol = cYellow("●")
+		case stateDone:
+			symbol = cGreen("✓")
+		case stateFailed:
+			symbol = cErr("✗")
+		case stateSkipped:
+			symbol = cDim("⊘")
+		}
+		label := p.step
+		if p.sys != "" {
+			label += "/" + p.sys
+		}
+		parts = append(parts, fmt.Sprintf("%s %s", symbol, label))
+	}
+	// Save cursor, move to last row, clear it, draw status, restore cursor
+	fmt.Fprintf(os.Stderr, "\033[s\033[%d;1H\033[2K%s\033[u", sb.height, strings.Join(parts, "  "))
+}
+
+// clear removes the status bar and resets the scroll region.
+func (sb *statusBar) clear() {
+	if sb.height == 0 {
+		return
+	}
+	// Reset scroll region to full terminal, clear the status row
+	fmt.Fprintf(os.Stderr, "\033[r\033[%d;1H\033[2K", sb.height)
+}
+
+// dagObserver receives structured events from the DAG executor.
+// Implementations handle terminal output vs MCP notifications vs testing.
+type dagObserver interface {
+	onStateChange(key string, s stepState)
+	onOutput(key string, line string)
+}
+
+// terminalObserver streams prefixed output to stderr with a sticky status bar.
+type terminalObserver struct {
+	sb       *statusBar
+	pf       prefixFormatter
+	prefixes map[string]string // pre-computed formatted prefixes
+	mu       sync.Mutex
+}
+
+func newTerminalObserver(procs []processEntry) *terminalObserver {
+	state := make(map[string]stepState)
+	for _, p := range procs {
+		state[p.key] = stateWaiting
+	}
+	pf := newPrefixFormatter(procs)
+	prefixes := make(map[string]string)
+	for _, p := range procs {
+		prefixes[p.key] = pf.format(p)
+	}
+	return &terminalObserver{
+		sb:       newStatusBar(procs, state),
+		pf:       pf,
+		prefixes: prefixes,
+	}
+}
+
+func (t *terminalObserver) onStateChange(key string, s stepState) {
+	// DAG mutex is held by caller; update status bar's state and render
+	t.sb.state[key] = s
+	t.sb.render()
+}
+
+func (t *terminalObserver) onOutput(key string, line string) {
+	t.mu.Lock()
+	fmt.Fprintf(os.Stderr, "%s %s\n", t.prefixes[key], line)
+	t.mu.Unlock()
+}
+
+func (t *terminalObserver) done() {
+	t.sb.clear()
+}
+
+// runDAG executes steps respecting dependencies. Independent steps run
+// concurrently via goroutines. If a step fails, its dependents are skipped.
+func runDAG(
+	procs []processEntry, config MultiStepConfig,
+	sha, self, cwd, logDir string,
+	hostMap, workdirMap map[string]string,
+	noSignoff bool,
+	obs dagObserver,
+) int {
+	depMap := buildDepMap(procs, config)
+
+	var mu sync.Mutex
+	state := make(map[string]stepState)
+	for _, p := range procs {
+		state[p.key] = stateWaiting
+	}
+
+	var wg sync.WaitGroup
+	hasFailure := false
+
+	// tryLaunch checks if a step's dependencies are met and launches it.
+	// Must be called with mu held.
+	var tryLaunch func(p processEntry)
+	tryLaunch = func(p processEntry) {
+		if state[p.key] != stateWaiting {
+			return
+		}
+		for _, dep := range depMap[p.key] {
+			switch state[dep] {
+			case stateFailed, stateSkipped:
+				state[p.key] = stateSkipped
+				obs.onStateChange(p.key, stateSkipped)
+				for _, pp := range procs {
+					tryLaunch(pp)
+				}
+				return
+			case stateWaiting, stateRunning:
+				return // not ready yet
 			}
 		}
+
+		state[p.key] = stateRunning
+		obs.onStateChange(p.key, stateRunning)
+		wg.Add(1)
+		go func(p processEntry) {
+			defer wg.Done()
+
+			step := config.Steps[p.step]
+			cmdParts := buildStepCmd(self, sha, p, step, workdirMap, noSignoff)
+
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				mu.Lock()
+				state[p.key] = stateFailed
+				hasFailure = true
+				obs.onStateChange(p.key, stateFailed)
+				mu.Unlock()
+				return
+			}
+
+			cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+			cmd.Dir = cwd
+			cmd.Stdout = pw
+			cmd.Stderr = pw
+
+			if err := cmd.Start(); err != nil {
+				pw.Close()
+				pr.Close()
+				mu.Lock()
+				state[p.key] = stateFailed
+				hasFailure = true
+				obs.onStateChange(p.key, stateFailed)
+				mu.Unlock()
+				return
+			}
+			pw.Close()
+
+			logFile := filepath.Join(logDir, sanitizeLogName(p.key)+".log")
+			logF, _ := os.Create(logFile)
+
+			scanner := bufio.NewScanner(pr)
+			scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
+			for scanner.Scan() {
+				line := scanner.Text()
+				obs.onOutput(p.key, line)
+				if logF != nil {
+					fmt.Fprintln(logF, line)
+				}
+			}
+			pr.Close()
+
+			rc := exitCode(cmd.Wait())
+			if logF != nil {
+				logF.Close()
+			}
+
+			mu.Lock()
+			if rc == 0 {
+				state[p.key] = stateDone
+			} else {
+				state[p.key] = stateFailed
+				hasFailure = true
+			}
+			obs.onStateChange(p.key, state[p.key])
+			for _, pp := range procs {
+				tryLaunch(pp)
+			}
+			mu.Unlock()
+		}(p)
 	}
 
-	// Print summary (skip in MCP mode — agent reads structured MCP responses)
-	if !args.mcp {
-		fmt.Fprintln(os.Stderr)
-		if pcExit == 0 {
-			logOk("All steps passed")
-		} else {
-			logWarn("One or more steps failed (exit %d)", pcExit)
-			printStepReport(logDir)
-			logInfo("Full logs: %s/", logDir)
+	mu.Lock()
+	for _, p := range procs {
+		tryLaunch(p)
+	}
+	mu.Unlock()
+
+	wg.Wait()
+
+	if hasFailure {
+		return 1
+	}
+	return 0
+}
+
+// buildDepMap returns a map from process key to its dependency keys.
+func buildDepMap(procs []processEntry, config MultiStepConfig) map[string][]string {
+	depMap := make(map[string][]string)
+	for _, p := range procs {
+		step := config.Steps[p.step]
+		var deps []string
+		for _, dep := range step.DependsOn {
+			for _, dp := range procs {
+				if dp.step == dep && dp.sys == p.sys {
+					deps = append(deps, dp.key)
+					break
+				}
+			}
+		}
+		depMap[p.key] = deps
+	}
+	return depMap
+}
+
+// buildStepCmd constructs the self-invocation command for a single step.
+func buildStepCmd(self, sha string, p processEntry, step StepConfig, workdirMap map[string]string, noSignoff bool) []string {
+	cmdParts := []string{self, "--sha", sha}
+	if noSignoff {
+		cmdParts = append(cmdParts, "--no-signoff")
+	}
+	if p.sys != "" {
+		cmdParts = append(cmdParts, "-s", p.sys)
+		if dir, ok := workdirMap[p.sys]; ok {
+			cmdParts = append(cmdParts, "--workdir", dir)
 		}
 	}
-
-	return pcExit
+	cmdParts = append(cmdParts, "-n", p.step, "--", step.Command)
+	return cmdParts
 }
 
 func collectSystems(config MultiStepConfig) []string {
@@ -274,8 +513,8 @@ func collectSystems(config MultiStepConfig) []string {
 }
 
 // buildProcessEntries expands the step×system matrix into individual
-// process entries. Each entry gets a unique key for process-compose:
-// just the step name when there's one system, "step (system)" when multiple.
+// process entries. Each entry gets a unique key: just the step name when
+// there's one system, "step (system)" when multiple.
 func buildProcessEntries(config MultiStepConfig) []processEntry {
 	var procs []processEntry
 	for stepName, step := range config.Steps {
@@ -294,113 +533,6 @@ func buildProcessEntries(config MultiStepConfig) []processEntry {
 	return procs
 }
 
-// generatePCConfig builds the process-compose JSON config. Each process
-// is a self-invocation of localci in single-step mode with --sha pinning.
-// Dependencies are resolved per-system: step B on x86_64-linux waits for
-// step A on x86_64-linux, not step A on aarch64-darwin.
-func generatePCConfig(
-	procs []processEntry, config MultiStepConfig,
-	sha, self, cwd, logDir string,
-	hostMap, workdirMap map[string]string,
-	mcpMode, noSignoff bool,
-) pcConfig {
-	processes := make(map[string]pcProcess)
-
-	for _, p := range procs {
-		step := config.Steps[p.step]
-
-		// In MCP mode, use @{sha:HEAD} template so agents can optionally
-		// pass a specific SHA. Defaults to HEAD (resolved fresh each time).
-		// In normal mode, use the pre-resolved SHA with --workdir.
-		stepSHA := sha
-		if mcpMode {
-			stepSHA = "@{sha:HEAD}"
-		}
-		cmdParts := []string{self, "--sha", stepSHA}
-		if noSignoff {
-			cmdParts = append(cmdParts, "--no-signoff")
-		}
-		if p.sys != "" {
-			cmdParts = append(cmdParts, "-s", p.sys)
-			if !mcpMode {
-				if dir, ok := workdirMap[p.sys]; ok {
-					cmdParts = append(cmdParts, "--workdir", dir)
-				}
-			}
-		}
-		cmdParts = append(cmdParts, "-n", p.step, "--", step.Command)
-
-		// Resolve dependencies: match by step name + same system
-		var depends map[string]pcDependency
-		for _, dep := range step.DependsOn {
-			for _, dp := range procs {
-				if dp.step == dep && dp.sys == p.sys {
-					if depends == nil {
-						depends = make(map[string]pcDependency)
-					}
-					depends[dp.key] = pcDependency{Condition: "process_completed_successfully"}
-					break
-				}
-			}
-		}
-
-		proc := pcProcess{
-			Command:     strings.Join(cmdParts, " "),
-			WorkingDir:  cwd,
-			LogLocation: filepath.Join(logDir, sanitizeLogName(p.key)+".log"),
-			Shutdown:    &pcShutdown{Signal: 9},
-			DependsOn:   depends,
-		}
-		if mcpMode {
-			proc.Disabled = true
-			proc.MCP = &pcMCP{
-				Type: "tool",
-				Arguments: []pcMCPArg{{
-					Name:        "sha",
-					Type:        "string",
-					Description: "Git ref to test (default: HEAD)",
-					Required:    false,
-				}},
-			}
-		} else {
-			proc.Availability = &pcAvailability{Restart: "exit_on_failure"}
-		}
-		if p.sys != "" {
-			hostname := hostMap[p.sys]
-			if hostname == "" {
-				hostname = "local"
-			}
-			proc.Namespace = fmt.Sprintf("%s (%s) @%s", p.sys, hostname, shortSHA(sha))
-		} else {
-			proc.Namespace = "@" + shortSHA(sha)
-		}
-
-		processes[p.key] = proc
-	}
-
-	cfg := pcConfig{
-		Version:          "0.5",
-		LogConfiguration: pcLogConfig{FlushEachLine: true},
-		Processes:        processes,
-	}
-	if mcpMode {
-		cfg.MCPServer = &pcMCPServer{Transport: "stdio"}
-	}
-	return cfg
-}
-
-var logNameReplacer = strings.NewReplacer("/", "-", " ", "-", "(", "-", ")", "-")
-var multiDash = regexp.MustCompile(`-{2,}`)
-
-func sanitizeLogName(name string) string {
-	s := logNameReplacer.Replace(name)
-	s = multiDash.ReplaceAllString(s, "-")
-	return strings.TrimRight(s, "-")
-}
-
-// selfPathResolved returns the real path to this executable, following
-// symlinks. Needed because nix wraps the binary and we need the wrapper
-// path for self-invocation in multi-step mode.
 func selfPathResolved() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -417,7 +549,15 @@ func mustHostname() string {
 	return h
 }
 
-// manifestEntry describes a step in the manifest file written to the log dir.
+var logNameReplacer = strings.NewReplacer("/", "-", " ", "-", "(", "-", ")", "-")
+var multiDash = regexp.MustCompile(`-{2,}`)
+
+func sanitizeLogName(name string) string {
+	s := logNameReplacer.Replace(name)
+	s = multiDash.ReplaceAllString(s, "-")
+	return strings.TrimRight(s, "-")
+}
+
 type manifestEntry struct {
 	Key     string `json:"key"`
 	Step    string `json:"step"`
@@ -439,7 +579,6 @@ func writeManifest(logDir string, procs []processEntry) {
 	os.WriteFile(filepath.Join(logDir, "manifest.json"), data, 0o644)
 }
 
-// stepResult holds a step's metadata and parsed log output.
 type stepResult struct {
 	step     string
 	system   string
@@ -448,7 +587,6 @@ type stepResult struct {
 }
 
 func loadStepResults(logDir string) []stepResult {
-	// Read manifest for step→system mapping
 	data, err := os.ReadFile(filepath.Join(logDir, "manifest.json"))
 	if err != nil {
 		return nil
@@ -467,14 +605,9 @@ func loadStepResults(logDir string) []stepResult {
 			continue
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(logData)), "\n") {
-			var entry struct {
-				Message string `json:"message"`
-			}
-			if json.Unmarshal([]byte(line), &entry) == nil && entry.Message != "" {
-				sr.messages = append(sr.messages, entry.Message)
-				if strings.Contains(entry.Message, "failed") {
-					sr.failed = true
-				}
+			sr.messages = append(sr.messages, line)
+			if strings.Contains(line, "failed") {
+				sr.failed = true
 			}
 		}
 		results = append(results, sr)
@@ -482,8 +615,6 @@ func loadStepResults(logDir string) []stepResult {
 	return results
 }
 
-// printStepReport prints a summary table of step results and the tail
-// of output for failed steps.
 func printStepReport(logDir string) {
 	results := loadStepResults(logDir)
 	if len(results) == 0 {
@@ -493,6 +624,17 @@ func printStepReport(logDir string) {
 	headerFmt := color.New(color.FgWhite, color.Bold).SprintfFunc()
 	passFmt := color.New(color.FgGreen).SprintfFunc()
 	failFmt := color.New(color.FgRed, color.Bold).SprintfFunc()
+	skipFmt := color.New(color.FgYellow).SprintfFunc()
+
+	statusStr := func(r stepResult) string {
+		if r.failed {
+			return failFmt("FAIL")
+		}
+		if len(r.messages) == 0 {
+			return skipFmt("skip")
+		}
+		return passFmt("pass")
+	}
 
 	hasSystems := false
 	for _, r := range results {
@@ -507,27 +649,18 @@ func printStepReport(logDir string) {
 		tbl := table.New("Step", "System", "Status")
 		tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
 		for _, r := range results {
-			status := passFmt("pass")
-			if r.failed {
-				status = failFmt("FAIL")
-			}
-			tbl.AddRow(r.step, r.system, status)
+			tbl.AddRow(r.step, r.system, statusStr(r))
 		}
 		tbl.Print()
 	} else {
 		tbl := table.New("Step", "Status")
 		tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
 		for _, r := range results {
-			status := passFmt("pass")
-			if r.failed {
-				status = failFmt("FAIL")
-			}
-			tbl.AddRow(r.step, status)
+			tbl.AddRow(r.step, statusStr(r))
 		}
 		tbl.Print()
 	}
 
-	// Tail of failed step output
 	const tailLines = 20
 	for _, r := range results {
 		if !r.failed {
@@ -547,5 +680,24 @@ func printStepReport(logDir string) {
 		for _, msg := range r.messages[start:] {
 			fmt.Fprintf(os.Stderr, "    %s\n", msg)
 		}
+	}
+}
+
+// buildDependencyGraph returns a JSON-serializable dependency graph
+// for the given config. Used by the MCP server's graph resource.
+func buildDependencyGraph(procs []processEntry, config MultiStepConfig) map[string]any {
+	depMap := buildDepMap(procs, config)
+	steps := make(map[string]any)
+	for _, p := range procs {
+		deps := depMap[p.key]
+		if deps == nil {
+			deps = []string{}
+		}
+		steps[p.key] = map[string]any{
+			"depends_on": deps,
+		}
+	}
+	return map[string]any{
+		"steps": steps,
 	}
 }
