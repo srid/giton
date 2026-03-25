@@ -8,11 +8,11 @@ import (
 	"strings"
 )
 
-// runProtect reads the config, computes all status contexts (expanding
-// the step×system matrix), and sets them as required status checks on
-// the repo's default branch via gh api.
-func runProtect(args cliArgs) int {
-	config, err := loadConfig(args.configFile)
+// runProtect reads the justfile ci module, computes all status contexts
+// (expanding the step×system matrix), and sets them as required status
+// checks on the repo's default branch via gh api.
+func runProtect() int {
+	config, err := loadFromJustfile()
 	if err != nil {
 		logErr("%v", err)
 		return 1
@@ -30,7 +30,6 @@ func runProtect(args cliArgs) int {
 		return 1
 	}
 
-	// Expand step×system matrix into status contexts
 	contexts := buildContexts(config)
 
 	logMsg("Setting required status checks on %s (%s)", cBold(repo), branch)
@@ -38,15 +37,14 @@ func runProtect(args cliArgs) int {
 		logInfo("%s", ctx)
 	}
 
-	// Build the protection payload
 	payload := map[string]any{
 		"required_status_checks": map[string]any{
 			"strict":   true,
 			"contexts": contexts,
 		},
-		"enforce_admins":              false,
+		"enforce_admins":                false,
 		"required_pull_request_reviews": nil,
-		"restrictions":                nil,
+		"restrictions":                  nil,
 	}
 	payloadJSON, _ := json.Marshal(payload)
 
@@ -66,8 +64,6 @@ func runProtect(args cliArgs) int {
 }
 
 // buildContexts expands the config into GitHub status context strings.
-// Without systems: "localci/<step>"
-// With systems: "localci/<step>/<system>"
 func buildContexts(config MultiStepConfig) []string {
 	var contexts []string
 	for name, step := range config.Steps {

@@ -1,8 +1,9 @@
 // localci — local CI tool that runs commands on Nix platforms and posts
 // GitHub commit statuses. Two modes: single-step (-- <cmd>) runs one
-// command; multi-step (-f config.json) orchestrates parallel steps via
-// process-compose. When --system differs from the current host, commands
-// run on a remote machine over SSH.
+// command; multi-step (justfile ci module) orchestrates parallel steps
+// via a native DAG executor. MCP mode (--mcp) starts an MCP server
+// exposing steps as tools. When --system differs from the current host,
+// commands run on a remote machine over SSH.
 package main
 
 import (
@@ -16,14 +17,20 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "protect":
-			// Re-parse flags after "protect" subcommand
 			os.Args = append(os.Args[:1], os.Args[2:]...)
-			args := parseArgs()
-			if args.configFile == "" {
-				logErr("protect requires -f <config.json>")
+			if !isInGitRepo() {
+				logErr("Not inside a git repository.")
 				os.Exit(1)
 			}
-			os.Exit(runProtect(args))
+			os.Exit(runProtect())
+		case "serve":
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			args := parseServeArgs()
+			if !isInGitRepo() {
+				logErr("Not inside a git repository.")
+				os.Exit(1)
+			}
+			os.Exit(runMCPHTTPServer(args.port))
 		case "run":
 			// "localci run" is the same as "localci" — strip "run"
 			os.Args = append(os.Args[:1], os.Args[2:]...)
@@ -37,15 +44,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// MCP mode: start MCP server immediately — SHA is resolved per tool call.
+	if args.mcp {
+		os.Exit(runMCPServer())
+	}
+
 	// --sha pins to an explicit commit and skips the clean-tree check.
-	// This is used internally by multi-step mode when self-invoking for
-	// each step, since the repo is already extracted to a temp dir.
 	var sha string
 	if args.shaPin != "" {
-		// Resolve symbolic refs (e.g. "HEAD") to full SHA for GitHub API
 		resolved, err := resolveRef(args.shaPin)
 		if err != nil {
-			sha = args.shaPin // fall back to literal if resolution fails
+			sha = args.shaPin
 		} else {
 			sha = resolved
 		}
@@ -62,14 +71,9 @@ func main() {
 		}
 	}
 
-	if args.configFile != "" {
-		os.Exit(runMultiStep(args, sha))
-	}
-
+	// If no command after --, run multi-step from justfile ci module
 	if len(args.cmd) == 0 {
-		logErr("A command after -- is required (or use -f for multi-step mode).")
-		flag.Usage()
-		os.Exit(1)
+		os.Exit(runMultiStep(args, sha))
 	}
 
 	os.Exit(runSingleStep(args, sha))
@@ -77,15 +81,13 @@ func main() {
 
 type cliArgs struct {
 	system         string
-	systemExplicit bool // true when -s/--system was passed (even for local system)
+	systemExplicit bool
 	name           string
-	cmd            []string // everything after --
+	cmd            []string
 	shaPin         string
-	configFile     string
-	tui            bool
 	mcp            bool
 	noSignoff      bool
-	workdir        string // pre-extracted dir, set by multi-step self-invocation
+	workdir        string
 }
 
 func parseArgs() cliArgs {
@@ -94,16 +96,16 @@ func parseArgs() cliArgs {
 	flag.StringVarP(&a.system, "system", "s", "", "Nix system string (if omitted, runs on current system)")
 	flag.StringVarP(&a.name, "name", "n", "", "Check name for GitHub status context (default: command name)")
 	flag.StringVar(&a.shaPin, "sha", "", "Pin to a specific commit SHA (skips clean-tree check)")
-	flag.StringVarP(&a.configFile, "file", "f", "", "JSON config file defining steps, systems, and dependencies")
-	flag.BoolVar(&a.tui, "tui", false, "Enable process-compose TUI (multi-step mode only)")
-	flag.BoolVar(&a.mcp, "mcp", false, "Expose steps as MCP tools via process-compose (multi-step mode only)")
+	flag.BoolVar(&a.mcp, "mcp", false, "Start MCP server exposing CI steps as tools")
 	flag.BoolVar(&a.noSignoff, "no-signoff", false, "Skip GitHub status posting (test locally before pushing)")
 	flag.StringVar(&a.workdir, "workdir", "", "Pre-extracted working directory (internal, used by multi-step mode)")
 
 	flag.Usage = func() {
 		logErr("Usage: localci [run] [options] -- <command...>")
-		logErr("       localci [run] -f <config.json>")
-		logErr("       localci protect -f <config.json>")
+		logErr("       localci [run] [options]                   (multi-step from justfile ci module)")
+		logErr("       localci [run] --mcp")
+		logErr("       localci serve [-p PORT]")
+		logErr("       localci protect")
 		logErr("")
 		flag.PrintDefaults()
 	}
@@ -111,8 +113,18 @@ func parseArgs() cliArgs {
 	flag.Parse()
 
 	a.systemExplicit = flag.CommandLine.Changed("system")
-	// Everything after -- is the command
 	a.cmd = flag.Args()
 
+	return a
+}
+
+type serveArgs struct {
+	port int
+}
+
+func parseServeArgs() serveArgs {
+	var a serveArgs
+	flag.IntVarP(&a.port, "port", "p", 8417, "HTTP port for MCP server")
+	flag.Parse()
 	return a
 }
