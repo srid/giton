@@ -42,16 +42,34 @@ func runMCPServer(args cliArgs) int {
 
 	s := server.NewMCPServer("localci", "0.1.0")
 
-	// Register a tool per step×system with dependency info in description.
-	// Agents see which tools can run in parallel without reading a resource.
+	// Compute parallel peers: steps that can run concurrently (no
+	// dependency relationship in either direction).
+	allDeps := transitiveDeps(depMap)
+	peers := make(map[string][]string)
+	for _, a := range procs {
+		for _, b := range procs {
+			if a.key == b.key {
+				continue
+			}
+			// Can run in parallel if neither transitively depends on the other
+			if !allDeps[a.key][b.key] && !allDeps[b.key][a.key] {
+				peers[a.key] = append(peers[a.key], b.key)
+			}
+		}
+	}
+
+	// Register a tool per step×system with dependency and parallelism info.
 	for _, p := range procs {
 		step := config.Steps[p.step]
-		desc := fmt.Sprintf("Run CI step: %s", step.Command)
+		desc := fmt.Sprintf("Run CI step: %s.", step.Command)
 		deps := depMap[p.key]
 		if len(deps) == 0 {
-			desc += " (no dependencies — can run immediately)"
+			desc += " No dependencies — can run immediately."
 		} else {
-			desc += fmt.Sprintf(" (depends on: %s — run those first)", strings.Join(deps, ", "))
+			desc += fmt.Sprintf(" Depends on: %s.", strings.Join(deps, ", "))
+		}
+		if peerList := peers[p.key]; len(peerList) > 0 {
+			desc += fmt.Sprintf(" Run in parallel with: %s.", strings.Join(peerList, ", "))
 		}
 
 		tool := mcp.NewTool(p.key,
@@ -77,6 +95,31 @@ func runMCPServer(args cliArgs) int {
 		return 1
 	}
 	return 0
+}
+
+// transitiveDeps computes the transitive closure of the dependency graph.
+// Returns a map where result[a][b] == true means a transitively depends on b.
+func transitiveDeps(depMap map[string][]string) map[string]map[string]bool {
+	result := make(map[string]map[string]bool)
+	var visit func(key string) map[string]bool
+	visit = func(key string) map[string]bool {
+		if cached, ok := result[key]; ok {
+			return cached
+		}
+		deps := make(map[string]bool)
+		result[key] = deps // cache before recursing to handle cycles
+		for _, d := range depMap[key] {
+			deps[d] = true
+			for td := range visit(d) {
+				deps[td] = true
+			}
+		}
+		return deps
+	}
+	for key := range depMap {
+		visit(key)
+	}
+	return result
 }
 
 func makeStepHandler(
