@@ -111,25 +111,21 @@ func (jt *jobTracker) pollAll(keys []string) string {
 	return strings.Join(lines, "\n")
 }
 
-// runMCPServer starts an MCP server over stdio. Steps are async: the step
-// tool kicks off execution and returns immediately, then agents poll
-// status-all for batch results.
-func runMCPServer(args cliArgs) int {
-	config, err := loadConfig(args.configFile)
+// buildMCPServer constructs the MCP server with all tools and resources
+// registered. Shared by both stdio (--mcp) and HTTP (serve) transports.
+func buildMCPServer(configFile string) (*server.MCPServer, error) {
+	config, err := loadConfig(configFile)
 	if err != nil {
-		logErr("%v", err)
-		return 1
+		return nil, err
 	}
 
 	if _, _, err := resolveHosts(config); err != nil {
-		logErr("%v", err)
-		return 1
+		return nil, err
 	}
 
 	self, err := selfPathResolved()
 	if err != nil {
-		logErr("Could not resolve self path: %v", err)
-		return 1
+		return nil, fmt.Errorf("could not resolve self path: %w", err)
 	}
 
 	procs := buildProcessEntries(config)
@@ -196,8 +192,39 @@ func runMCPServer(args cliArgs) int {
 	)
 	s.AddResource(graphResource, makeGraphHandler(procs, config))
 
+	return s, nil
+}
+
+// runMCPServer starts an MCP server over stdio.
+func runMCPServer(args cliArgs) int {
+	s, err := buildMCPServer(args.configFile)
+	if err != nil {
+		logErr("%v", err)
+		return 1
+	}
 	if err := server.ServeStdio(s); err != nil {
 		logErr("MCP server error: %v", err)
+		return 1
+	}
+	return 0
+}
+
+// runMCPHTTPServer starts a persistent MCP server over Streamable HTTP.
+func runMCPHTTPServer(configFile string, port int) int {
+	s, err := buildMCPServer(configFile)
+	if err != nil {
+		logErr("%v", err)
+		return 1
+	}
+
+	addr := fmt.Sprintf(":%d", port)
+	httpServer := server.NewStreamableHTTPServer(s,
+		server.WithEndpointPath("/mcp"),
+	)
+
+	logMsg("MCP server listening on http://localhost%s/mcp", addr)
+	if err := httpServer.Start(addr); err != nil {
+		logErr("HTTP server error: %v", err)
 		return 1
 	}
 	return 0

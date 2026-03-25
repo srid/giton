@@ -17,7 +17,6 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "protect":
-			// Re-parse flags after "protect" subcommand
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 			args := parseArgs()
 			if args.configFile == "" {
@@ -25,6 +24,19 @@ func main() {
 				os.Exit(1)
 			}
 			os.Exit(runProtect(args))
+		case "serve":
+			// Persistent HTTP MCP server
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			args := parseServeArgs()
+			if args.configFile == "" {
+				logErr("serve requires -f <config.json>")
+				os.Exit(1)
+			}
+			if !isInGitRepo() {
+				logErr("Not inside a git repository.")
+				os.Exit(1)
+			}
+			os.Exit(runMCPHTTPServer(args.configFile, args.port))
 		case "run":
 			// "localci run" is the same as "localci" — strip "run"
 			os.Args = append(os.Args[:1], os.Args[2:]...)
@@ -112,6 +124,7 @@ func parseArgs() cliArgs {
 		logErr("Usage: localci [run] [options] -- <command...>")
 		logErr("       localci [run] -f <config.json>")
 		logErr("       localci [run] --mcp -f <config.json>")
+		logErr("       localci serve -f <config.json> [-p PORT]")
 		logErr("       localci protect -f <config.json>")
 		logErr("")
 		flag.PrintDefaults()
@@ -123,5 +136,18 @@ func parseArgs() cliArgs {
 	// Everything after -- is the command
 	a.cmd = flag.Args()
 
+	return a
+}
+
+type serveArgs struct {
+	configFile string
+	port       int
+}
+
+func parseServeArgs() serveArgs {
+	var a serveArgs
+	flag.StringVarP(&a.configFile, "file", "f", "", "JSON config file defining steps, systems, and dependencies")
+	flag.IntVarP(&a.port, "port", "p", 8417, "HTTP port for MCP server")
+	flag.Parse()
 	return a
 }
