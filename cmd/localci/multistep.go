@@ -64,6 +64,9 @@ func loadFromJustfile() (MultiStepConfig, error) {
 
 	steps := make(map[string]StepConfig)
 	for name, recipe := range ciModule.Recipes {
+		if name == "default" {
+			continue
+		}
 		step := StepConfig{
 			Command: fmt.Sprintf("just ci::%s", name),
 		}
