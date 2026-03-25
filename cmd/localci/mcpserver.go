@@ -19,19 +19,29 @@ type jobResult struct {
 	rc     int
 }
 
-// jobTracker manages async step executions.
+// jobTracker manages async step executions with dependency ordering.
+// Steps whose dependencies haven't passed yet wait internally —
+// the agent can fire all tools at once and the tracker handles ordering.
 type jobTracker struct {
 	mu      sync.Mutex
 	running map[string]chan jobResult
 	done    map[string]jobResult
 	shas    map[string]string // key → short SHA used
+	depMap  map[string][]string
+	doneCh  map[string]chan struct{} // closed when step completes (pass or fail)
 }
 
-func newJobTracker() *jobTracker {
+func newJobTracker(depMap map[string][]string, keys []string) *jobTracker {
+	doneCh := make(map[string]chan struct{})
+	for _, k := range keys {
+		doneCh[k] = make(chan struct{})
+	}
 	return &jobTracker{
 		running: make(map[string]chan jobResult),
 		done:    make(map[string]jobResult),
 		shas:    make(map[string]string),
+		depMap:  depMap,
+		doneCh:  doneCh,
 	}
 }
 
@@ -45,41 +55,79 @@ func (jt *jobTracker) start(key, sha string, run func() jobResult) string {
 	if prev, ok := jt.done[key]; ok && prev.rc == 0 {
 		return "already passed"
 	}
-	// Allow re-running failed steps
-	delete(jt.done, key)
+	// Allow re-running failed steps — reset done channel
+	if _, ok := jt.done[key]; ok {
+		delete(jt.done, key)
+		jt.doneCh[key] = make(chan struct{})
+	}
 
 	jt.shas[key] = sha
 	ch := make(chan jobResult, 1)
 	jt.running[key] = ch
+
+	deps := jt.depMap[key]
+
 	go func() {
+		// Wait for dependencies to complete successfully
+		for _, dep := range deps {
+			jt.mu.Lock()
+			depCh := jt.doneCh[dep]
+			jt.mu.Unlock()
+			<-depCh
+
+			// Check if dep passed
+			jt.mu.Lock()
+			depResult, ok := jt.done[dep]
+			jt.mu.Unlock()
+			if ok && depResult.rc != 0 {
+				// Dependency failed — skip this step
+				ch <- jobResult{output: fmt.Sprintf("skipped: dependency %s failed", dep), rc: 1}
+				return
+			}
+		}
 		ch <- run()
 	}()
+
+	if len(deps) > 0 {
+		return fmt.Sprintf("queued (waiting for %s)", strings.Join(deps, ", "))
+	}
 	return "started"
 }
 
+// complete drains a result and marks the step done, closing its doneCh.
+func (jt *jobTracker) complete(key string, r jobResult) {
+	jt.done[key] = r
+	// Close doneCh to unblock dependents
+	if ch, ok := jt.doneCh[key]; ok {
+		select {
+		case <-ch: // already closed
+		default:
+			close(ch)
+		}
+	}
+}
+
 // pollAll returns a compact single-line status string.
-// Format: "IN PROGRESS @abc123 | ✓ build | ● test | · e2e"
-// When done with failures, appends failure output after the summary line.
 func (jt *jobTracker) pollAll(keys []string) string {
 	jt.mu.Lock()
 	defer jt.mu.Unlock()
-
-	// Drain completed channels
-	for key, ch := range jt.running {
-		select {
-		case r := <-ch:
-			delete(jt.running, key)
-			jt.done[key] = r
-		default:
-		}
-	}
 
 	// If nothing has been started, nudge the agent
 	if len(jt.running) == 0 && len(jt.done) == 0 {
 		return "NO STEPS STARTED — call individual step tools first, then poll status-all"
 	}
 
-	// Collect SHA (all steps should use the same one, pick first available)
+	// Drain completed channels
+	for key, ch := range jt.running {
+		select {
+		case r := <-ch:
+			delete(jt.running, key)
+			jt.complete(key, r)
+		default:
+		}
+	}
+
+	// Collect SHA
 	var sha string
 	for _, key := range keys {
 		if s, ok := jt.shas[key]; ok {
@@ -160,7 +208,12 @@ func buildMCPServer() (*server.MCPServer, error) {
 
 	procs := buildProcessEntries(config)
 	depMap := buildDepMap(procs, config)
-	tracker := newJobTracker()
+
+	var stepKeys []string
+	for _, p := range procs {
+		stepKeys = append(stepKeys, p.key)
+	}
+	tracker := newJobTracker(depMap, stepKeys)
 
 	s := server.NewMCPServer("localci", "0.1.0")
 
@@ -202,10 +255,6 @@ func buildMCPServer() (*server.MCPServer, error) {
 	}
 
 	// status-all tool
-	var stepKeys []string
-	for _, p := range procs {
-		stepKeys = append(stepKeys, p.key)
-	}
 	statusAllTool := mcp.NewTool("status-all",
 		mcp.WithDescription("Poll all step statuses. Returns a single-line summary like: IN PROGRESS @sha | ✓ build | ● test | · e2e"),
 	)
