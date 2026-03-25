@@ -1,9 +1,10 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -169,6 +170,16 @@ const (
 	stateSkipped
 )
 
+// prefixColors cycles through distinct colors for step log prefixes.
+var prefixColors = []*color.Color{
+	color.New(color.FgCyan),
+	color.New(color.FgMagenta),
+	color.New(color.FgBlue),
+	color.New(color.FgYellow),
+	color.New(color.FgGreen),
+	color.New(color.FgRed),
+}
+
 // runDAG executes steps respecting dependencies. Independent steps run
 // concurrently via goroutines. If a step fails, its dependents are skipped.
 func runDAG(
@@ -188,6 +199,7 @@ func runDAG(
 
 	var wg sync.WaitGroup
 	hasFailure := false
+	launched := 0
 
 	// tryLaunch checks if a step's dependencies are met and launches it.
 	// Must be called with mu held.
@@ -212,30 +224,53 @@ func runDAG(
 		}
 
 		state[p.key] = stateRunning
+		launched++
 		wg.Add(1)
-		go func(p processEntry) {
+		go func(p processEntry, colorIdx int) {
 			defer wg.Done()
 
 			step := config.Steps[p.step]
 			cmdParts := buildStepCmd(self, sha, p, step, workdirMap, noSignoff)
+
+			prefix := prefixColors[colorIdx%len(prefixColors)].Sprintf("[%s]", p.key)
 			logMsg("Running %s...", cBold(p.key))
 
 			cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
 			cmd.Dir = cwd
-			var buf bytes.Buffer
-			cmd.Stdout = &buf
-			cmd.Stderr = &buf
-			rc := exitCode(cmd.Run())
 
-			output := buf.Bytes()
+			// Pipe stdout+stderr for real-time line streaming
+			pr, pw := io.Pipe()
+			cmd.Stdout = pw
+			cmd.Stderr = pw
 
-			// Write log file
 			logFile := filepath.Join(logDir, sanitizeLogName(p.key)+".log")
-			os.WriteFile(logFile, output, 0o644)
+			logF, _ := os.Create(logFile)
 
-			// Print captured output so callers can see step results
+			// Stream lines to stderr with colored prefix and to log file
+			var scanDone sync.WaitGroup
+			scanDone.Add(1)
+			go func() {
+				defer scanDone.Done()
+				scanner := bufio.NewScanner(pr)
+				for scanner.Scan() {
+					line := scanner.Text()
+					mu.Lock()
+					fmt.Fprintf(os.Stderr, "%s %s\n", prefix, line)
+					mu.Unlock()
+					if logF != nil {
+						fmt.Fprintln(logF, line)
+					}
+				}
+			}()
+
+			rc := exitCode(cmd.Run())
+			pw.Close()
+			scanDone.Wait()
+			if logF != nil {
+				logF.Close()
+			}
+
 			mu.Lock()
-			os.Stderr.Write(output)
 			if rc == 0 {
 				state[p.key] = stateDone
 				logOk("%s passed", cBold(p.key))
@@ -249,7 +284,7 @@ func runDAG(
 				tryLaunch(pp)
 			}
 			mu.Unlock()
-		}(p)
+		}(p, launched)
 	}
 
 	mu.Lock()
