@@ -24,16 +24,18 @@ type jobTracker struct {
 	mu      sync.Mutex
 	running map[string]chan jobResult
 	done    map[string]jobResult
+	shas    map[string]string // key → short SHA used
 }
 
 func newJobTracker() *jobTracker {
 	return &jobTracker{
 		running: make(map[string]chan jobResult),
 		done:    make(map[string]jobResult),
+		shas:    make(map[string]string),
 	}
 }
 
-func (jt *jobTracker) start(key string, run func() jobResult) string {
+func (jt *jobTracker) start(key, sha string, run func() jobResult) string {
 	jt.mu.Lock()
 	defer jt.mu.Unlock()
 
@@ -44,6 +46,7 @@ func (jt *jobTracker) start(key string, run func() jobResult) string {
 		return "already completed"
 	}
 
+	jt.shas[key] = sha
 	ch := make(chan jobResult, 1)
 	jt.running[key] = ch
 	go func() {
@@ -52,6 +55,9 @@ func (jt *jobTracker) start(key string, run func() jobResult) string {
 	return "started"
 }
 
+// pollAll returns a compact single-line status string.
+// Format: "IN PROGRESS @abc123 | ✓ build | ● test | · e2e"
+// When done with failures, appends failure output after the summary line.
 func (jt *jobTracker) pollAll(keys []string) string {
 	jt.mu.Lock()
 	defer jt.mu.Unlock()
@@ -66,45 +72,67 @@ func (jt *jobTracker) pollAll(keys []string) string {
 		}
 	}
 
-	var lines []string
+	// Collect SHA (all steps should use the same one, pick first available)
+	var sha string
+	for _, key := range keys {
+		if s, ok := jt.shas[key]; ok {
+			sha = s
+			break
+		}
+	}
+
+	var parts []string
 	allDone := true
 	anyFailed := false
+	var failedKeys []string
 
 	for _, key := range keys {
 		if r, ok := jt.done[key]; ok {
 			if r.rc != 0 {
 				anyFailed = true
-				lines = append(lines, fmt.Sprintf("✗ %s: FAILED (exit %d)", key, r.rc))
+				failedKeys = append(failedKeys, key)
+				parts = append(parts, fmt.Sprintf("✗ %s", key))
 			} else {
-				lines = append(lines, fmt.Sprintf("✓ %s: passed", key))
+				parts = append(parts, fmt.Sprintf("✓ %s", key))
 			}
 		} else if _, ok := jt.running[key]; ok {
 			allDone = false
-			lines = append(lines, fmt.Sprintf("● %s: running", key))
+			parts = append(parts, fmt.Sprintf("● %s", key))
 		} else {
 			allDone = false
-			lines = append(lines, fmt.Sprintf("· %s: not started", key))
+			parts = append(parts, fmt.Sprintf("· %s", key))
 		}
 	}
 
+	var status string
 	if allDone {
 		if anyFailed {
-			lines = append([]string{"STATUS: DONE (some steps failed)\n"}, lines...)
+			status = "FAILED"
 		} else {
-			lines = append([]string{"STATUS: ALL PASSED\n"}, lines...)
+			status = "ALL PASSED"
 		}
 	} else {
-		lines = append([]string{"STATUS: IN PROGRESS\n"}, lines...)
+		status = "IN PROGRESS"
 	}
 
-	// Append output for failed steps
-	for _, key := range keys {
-		if r, ok := jt.done[key]; ok && r.rc != 0 {
-			lines = append(lines, fmt.Sprintf("\n--- %s output ---\n%s", key, r.output))
+	shaLabel := ""
+	if sha != "" {
+		shaLabel = " @" + sha
+	}
+
+	summary := fmt.Sprintf("%s%s | %s", status, shaLabel, strings.Join(parts, " | "))
+
+	// Append truncated output only for failed steps
+	if anyFailed {
+		for _, key := range failedKeys {
+			if r, ok := jt.done[key]; ok {
+				tail := truncateOutput(r.output, 30)
+				summary += fmt.Sprintf("\n\n--- %s (exit %d) ---\n%s", key, r.rc, tail)
+			}
 		}
 	}
 
-	return strings.Join(lines, "\n")
+	return summary
 }
 
 // buildMCPServer constructs the MCP server with all tools and resources.
@@ -172,7 +200,7 @@ func buildMCPServer() (*server.MCPServer, error) {
 		stepKeys = append(stepKeys, p.key)
 	}
 	statusAllTool := mcp.NewTool("status-all",
-		mcp.WithDescription("Poll all step statuses in one call. Returns summary with pass/fail/running for each step, plus full logs for failures."),
+		mcp.WithDescription("Poll all step statuses. Returns a single-line summary like: IN PROGRESS @sha | ✓ build | ● test | · e2e"),
 	)
 	s.AddTool(statusAllTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText(tracker.pollAll(stepKeys)), nil
@@ -236,6 +264,7 @@ func makeAsyncStepHandler(
 			sha = resolved
 		}
 
+		short := shortSHA(sha)
 		cwd := validWorkdir()
 
 		cmdParts := []string{self, "--sha", sha}
@@ -247,7 +276,7 @@ func makeAsyncStepHandler(
 		}
 		cmdParts = append(cmdParts, "-n", p.step, "--", step.Command)
 
-		status := tracker.start(p.key, func() jobResult {
+		status := tracker.start(p.key, short, func() jobResult {
 			cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
 			cmd.Dir = cwd
 			var buf bytes.Buffer
@@ -261,7 +290,7 @@ func makeAsyncStepHandler(
 			return jobResult{output: output, rc: rc}
 		})
 
-		return mcp.NewToolResultText(fmt.Sprintf("%s: %s", p.key, status)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("%s: %s @%s", p.key, status, short)), nil
 	}
 }
 
