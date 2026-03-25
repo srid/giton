@@ -41,11 +41,20 @@ func runMCPServer(args cliArgs) int {
 
 	s := server.NewMCPServer("localci", "0.1.0")
 
-	// Register a tool for each step×system combination
+	// "run-all" tool: runs the entire DAG with parallelization
+	runAllTool := mcp.NewTool("run-all",
+		mcp.WithDescription("Run all CI steps in parallel (respecting dependencies)"),
+		mcp.WithString("sha",
+			mcp.Description("Git ref to test (default: HEAD)"),
+		),
+	)
+	s.AddTool(runAllTool, makeRunAllHandler(self, cwd, args.configFile, args.noSignoff))
+
+	// Individual step tools for targeted runs
 	for _, p := range procs {
 		step := config.Steps[p.step]
 		tool := mcp.NewTool(p.key,
-			mcp.WithDescription(fmt.Sprintf("Run CI step: %s", step.Command)),
+			mcp.WithDescription(fmt.Sprintf("Run single CI step: %s", step.Command)),
 			mcp.WithString("sha",
 				mcp.Description("Git ref to test (default: HEAD)"),
 			),
@@ -67,6 +76,36 @@ func runMCPServer(args cliArgs) int {
 		return 1
 	}
 	return 0
+}
+
+func makeRunAllHandler(self, cwd, configFile string, noSignoff bool) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sha := request.GetString("sha", "HEAD")
+
+		resolved, err := resolveRef(sha)
+		if err == nil {
+			sha = resolved
+		}
+
+		cmdParts := []string{self, "--sha", sha, "-f", configFile}
+		if noSignoff {
+			cmdParts = append(cmdParts, "--no-signoff")
+		}
+
+		cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+		cmd.Dir = cwd
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		rc := exitCode(cmd.Run())
+
+		output := truncateOutput(buf.String(), 200)
+
+		if rc != 0 {
+			return mcp.NewToolResultText(fmt.Sprintf("FAILED (exit %d)\n\n%s", rc, output)), nil
+		}
+		return mcp.NewToolResultText(output), nil
+	}
 }
 
 func makeStepHandler(
