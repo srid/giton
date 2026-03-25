@@ -14,8 +14,8 @@ import (
 )
 
 // runMCPServer starts an MCP server over stdio, exposing each step as a
-// tool and the dependency graph as a resource. Agents read the graph to
-// determine which tools can be called in parallel.
+// tool and the dependency graph as a resource. Tool descriptions include
+// dependency info so agents can parallelize independent steps.
 func runMCPServer(args cliArgs) int {
 	config, err := loadConfig(args.configFile)
 	if err != nil {
@@ -26,8 +26,7 @@ func runMCPServer(args cliArgs) int {
 	cwd, _ := os.Getwd()
 
 	// Resolve and warm SSH connections upfront — tool handlers can't prompt.
-	hostMap, allSystems, err := resolveHosts(config)
-	if err != nil {
+	if _, _, err := resolveHosts(config); err != nil {
 		logErr("%v", err)
 		return 1
 	}
@@ -39,26 +38,24 @@ func runMCPServer(args cliArgs) int {
 	}
 
 	procs := buildProcessEntries(config)
+	depMap := buildDepMap(procs, config)
 
 	s := server.NewMCPServer("localci", "0.1.0")
 
-	// "run-all" tool: runs the entire DAG with parallelization in-process
-	runAllTool := mcp.NewTool("run-all",
-		mcp.WithDescription("Run all CI steps in parallel (respecting dependencies)"),
-		mcp.WithString("sha",
-			mcp.Description("Git ref to test (default: HEAD)"),
-		),
-	)
-	s.AddTool(runAllTool, makeRunAllHandler(
-		procs, config, self, cwd,
-		hostMap, allSystems, args.noSignoff,
-	))
-
-	// Individual step tools for targeted runs
+	// Register a tool per step×system with dependency info in description.
+	// Agents see which tools can run in parallel without reading a resource.
 	for _, p := range procs {
 		step := config.Steps[p.step]
+		desc := fmt.Sprintf("Run CI step: %s", step.Command)
+		deps := depMap[p.key]
+		if len(deps) == 0 {
+			desc += " (no dependencies — can run immediately)"
+		} else {
+			desc += fmt.Sprintf(" (depends on: %s — run those first)", strings.Join(deps, ", "))
+		}
+
 		tool := mcp.NewTool(p.key,
-			mcp.WithDescription(fmt.Sprintf("Run single CI step: %s", step.Command)),
+			mcp.WithDescription(desc),
 			mcp.WithString("sha",
 				mcp.Description("Git ref to test (default: HEAD)"),
 			),
@@ -66,7 +63,7 @@ func runMCPServer(args cliArgs) int {
 		s.AddTool(tool, makeStepHandler(p, step, self, cwd, args.noSignoff))
 	}
 
-	// Register dependency graph resource
+	// Dependency graph resource (structured JSON for programmatic access)
 	graphResource := mcp.NewResource(
 		"localci://graph",
 		"Dependency Graph",
@@ -80,135 +77,6 @@ func runMCPServer(args cliArgs) int {
 		return 1
 	}
 	return 0
-}
-
-// mcpObserver sends structured MCP log notifications on DAG events.
-type mcpObserver struct {
-	ctx context.Context
-	srv *server.MCPServer
-}
-
-func (m *mcpObserver) onStateChange(key string, s stepState) {
-	if m.srv == nil {
-		return
-	}
-	var msg string
-	switch s {
-	case stateRunning:
-		msg = fmt.Sprintf("▶ %s: running", key)
-	case stateDone:
-		msg = fmt.Sprintf("✓ %s: passed", key)
-	case stateFailed:
-		msg = fmt.Sprintf("✗ %s: failed", key)
-	case stateSkipped:
-		msg = fmt.Sprintf("⊘ %s: skipped (dependency failed)", key)
-	default:
-		return
-	}
-	m.srv.SendNotificationToClient(m.ctx, "notifications/message", map[string]any{
-		"level": "info",
-		"data":  msg,
-	})
-}
-
-func (m *mcpObserver) onOutput(key string, line string) {
-	// Don't spam every line — agent gets the full output in the result
-}
-
-func makeRunAllHandler(
-	procs []processEntry, config MultiStepConfig,
-	self, cwd string,
-	hostMap map[string]string, allSystems []string,
-	noSignoff bool,
-) server.ToolHandlerFunc {
-	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sha := request.GetString("sha", "HEAD")
-
-		resolved, err := resolveRef(sha)
-		if err == nil {
-			sha = resolved
-		}
-
-		currentSystem := getCurrentSystem()
-
-		// Extract repo per system
-		workdirBase := fmt.Sprintf("/tmp/localci-%s", shortSHA(sha))
-		workdirMap := make(map[string]string)
-
-		localDir := workdirBase + "-local"
-		if err := extractRepoLocal(sha, localDir); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("extract failed: %v", err)), nil
-		}
-		workdirMap[currentSystem] = localDir
-
-		for _, sys := range allSystems {
-			if sys != currentSystem {
-				host := hostMap[sys]
-				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
-				if err := extractRepoRemote(sha, host, rdir); err != nil {
-					return mcp.NewToolResultError(fmt.Sprintf("remote extract failed: %v", err)), nil
-				}
-				workdirMap[sys] = rdir
-			}
-		}
-
-		logDir := fmt.Sprintf("/tmp/localci-%s-logs", shortSHA(sha))
-		os.RemoveAll(logDir)
-		os.MkdirAll(logDir, 0o755)
-		writeManifest(logDir, procs)
-
-		obs := &mcpObserver{
-			ctx: ctx,
-			srv: server.ServerFromContext(ctx),
-		}
-
-		rc := runDAG(procs, config, sha, self, cwd, logDir, hostMap, workdirMap, noSignoff, obs)
-
-		// Build structured result from step logs
-		results := loadStepResults(logDir)
-		var output strings.Builder
-		for _, r := range results {
-			label := r.step
-			if r.system != "" {
-				label += " (" + r.system + ")"
-			}
-			if r.failed {
-				fmt.Fprintf(&output, "✗ %s: FAILED\n", label)
-			} else if len(r.messages) == 0 {
-				fmt.Fprintf(&output, "⊘ %s: skipped\n", label)
-			} else {
-				fmt.Fprintf(&output, "✓ %s: passed\n", label)
-			}
-			// Include tail of output for failed steps
-			if r.failed {
-				start := 0
-				if len(r.messages) > 20 {
-					start = len(r.messages) - 20
-				}
-				for _, msg := range r.messages[start:] {
-					fmt.Fprintf(&output, "  %s\n", msg)
-				}
-			}
-		}
-
-		// Cleanup
-		if rc == 0 {
-			os.RemoveAll(logDir)
-		}
-		os.RemoveAll(localDir)
-		for _, sys := range allSystems {
-			if sys != currentSystem {
-				host := hostMap[sys]
-				rdir := fmt.Sprintf("%s-%s", workdirBase, sys)
-				exec.Command("ssh", host, "rm -rf '"+rdir+"'").Run()
-			}
-		}
-
-		if rc != 0 {
-			return mcp.NewToolResultText(fmt.Sprintf("FAILED (exit %d)\n\n%s", rc, output.String())), nil
-		}
-		return mcp.NewToolResultText(output.String()), nil
-	}
 }
 
 func makeStepHandler(
