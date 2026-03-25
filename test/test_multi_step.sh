@@ -1,23 +1,38 @@
 # Multi-step mode tests
+# Tests create justfiles with ci modules in the test repo
 
 CURRENT_SYSTEM=$(nix eval --raw --impure --expr builtins.currentSystem)
 
+# Helper: set up a justfile ci module in the test repo
+setup_ci() {
+  echo "mod ci" > "$TEST_REPO/justfile"
+  # ci.just content comes from $1
+  echo "$1" > "$TEST_REPO/ci.just"
+  cd "$TEST_REPO"
+  git add justfile ci.just
+  git commit -q -m "update ci config" --allow-empty
+  SHA=$(git rev-parse HEAD)
+}
+
 # Basic success
-cat > "$WORK/basic.json" << 'EOF'
-{"steps":{"a":{"command":"echo step-a"},"b":{"command":"echo step-b"}}}
-EOF
-run_localci --sha "$SHA" -f "$WORK/basic.json"
+setup_ci 'a:
+    echo step-a
+b:
+    echo step-b'
+run_localci --sha "$SHA"
 if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "step-a" && echo "$OUT" | grep -q "step-b"; then
   pass "basic success"
 else
-  fail "basic success (rc=$RC)"
+  fail "basic success (rc=$RC, out=$OUT)"
 fi
 
 # Dependency ordering
-cat > "$WORK/deps.json" << 'EOF'
-{"steps":{"first":{"command":"echo FIRST"},"second":{"command":"echo SECOND","depends_on":["first"]}}}
-EOF
-run_localci --sha "$SHA" -f "$WORK/deps.json"
+setup_ci '[metadata("depends_on", "first")]
+second:
+    echo SECOND
+first:
+    echo FIRST'
+run_localci --sha "$SHA"
 if [[ $RC -eq 0 ]]; then
   first_pos=$(echo "$OUT" | grep -n "FIRST" | head -1 | cut -d: -f1)
   second_pos=$(echo "$OUT" | grep -n "SECOND" | head -1 | cut -d: -f1)
@@ -31,21 +46,24 @@ else
 fi
 
 # Failure propagation
-cat > "$WORK/fail.json" << 'EOF'
-{"steps":{"ok":{"command":"echo ok"},"bad":{"command":"exit 1","depends_on":["ok"]}}}
-EOF
-run_localci --sha "$SHA" -f "$WORK/fail.json"
-if [[ $RC -ne 0 ]] && echo "$OUT" | grep -q "failed"; then
+setup_ci '[metadata("depends_on", "ok")]
+bad:
+    exit 1
+ok:
+    echo ok'
+run_localci --sha "$SHA"
+if [[ $RC -ne 0 ]]; then
   pass "failure propagates exit code"
 else
   fail "failure propagates exit code (rc=$RC)"
 fi
 
 # Independent step failure propagates
-cat > "$WORK/indep-fail.json" << 'EOF'
-{"steps":{"good":{"command":"echo ok"},"bad":{"command":"exit 1"}}}
-EOF
-run_localci --sha "$SHA" -f "$WORK/indep-fail.json"
+setup_ci 'good:
+    echo ok
+bad:
+    exit 1'
+run_localci --sha "$SHA"
 if [[ $RC -ne 0 ]]; then
   pass "independent step failure propagates exit code"
 else
@@ -53,8 +71,13 @@ else
 fi
 
 # Log files created on failure
+setup_ci '[metadata("depends_on", "ok")]
+bad:
+    exit 1
+ok:
+    echo ok'
 rm -rf /tmp/localci-"${SHA:0:12}"-logs
-run_localci --sha "$SHA" -f "$WORK/fail.json"
+run_localci --sha "$SHA"
 LOG_DIR="/tmp/localci-${SHA:0:12}-logs"
 if [[ -d "$LOG_DIR" ]] && ls "$LOG_DIR"/*.log &>/dev/null; then
   pass "creates log files on failure"
@@ -62,19 +85,25 @@ else
   fail "creates log files on failure (dir=$LOG_DIR)"
 fi
 
-# Config file not found
-run_localci --sha "$SHA" -f /nonexistent.json
-if [[ $RC -ne 0 ]] && echo "$OUT" | grep -qi "not found"; then
-  pass "config file not found exits with error"
+# No ci module exits with error
+echo "# empty" > "$TEST_REPO/justfile"
+rm -f "$TEST_REPO/ci.just"
+git add justfile
+git rm -q -f ci.just 2>/dev/null || true
+git commit -q -m "remove ci module" --allow-empty
+SHA=$(git rev-parse HEAD)
+run_localci --sha "$SHA"
+if [[ $RC -ne 0 ]] && echo "$OUT" | grep -qi "ci"; then
+  pass "no ci module exits with error"
 else
-  fail "config file not found exits with error (rc=$RC)"
+  fail "no ci module exits with error (rc=$RC)"
 fi
 
 # With systems (local)
-cat > "$WORK/sys.json" << EOF
-{"steps":{"build":{"systems":["$CURRENT_SYSTEM"],"command":"echo built"}}}
-EOF
-run_localci --sha "$SHA" -f "$WORK/sys.json"
+setup_ci "[metadata(\"systems\", \"$CURRENT_SYSTEM\")]
+build:
+    echo built"
+run_localci --sha "$SHA"
 if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "built"; then
   pass "with systems (local)"
 else
@@ -82,11 +111,12 @@ else
 fi
 
 # Posts GitHub statuses for each step
+setup_ci 'alpha:
+    true
+beta:
+    true'
 true > "$GH_CALL_LOG"
-cat > "$WORK/statuses.json" << 'EOF'
-{"steps":{"alpha":{"command":"true"},"beta":{"command":"true"}}}
-EOF
-run_localci --sha "$SHA" -f "$WORK/statuses.json"
+run_localci --sha "$SHA"
 alpha_count=$(grep -c "localci/alpha" "$GH_CALL_LOG" || true)
 beta_count=$(grep -c "localci/beta" "$GH_CALL_LOG" || true)
 if [[ "$alpha_count" -ge 2 && "$beta_count" -ge 2 ]]; then

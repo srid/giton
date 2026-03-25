@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "localci": {
-      "type": "stdio",
-      "command": "nix",
-      "args": ["run", "github:srid/localci", "--", "--mcp", "--sha", "HEAD", "-f", "localci.json"]
+      "type": "http",
+      "url": "http://localhost:8417/mcp"
     }
   }
 }

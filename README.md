@@ -30,31 +30,37 @@ The GitHub status context includes the system: `localci/build/aarch64-darwin`.
 
 ## Multi-step
 
-For projects with multiple CI steps, define them in a JSON config:
+For projects with multiple CI steps, define them in a `ci.just` module using [just](https://github.com/casey/just) with [metadata attributes](https://github.com/casey/just/pull/2794):
 
-```json
-{
-  "steps": {
-    "build": {
-      "systems": ["x86_64-linux", "aarch64-darwin"],
-      "command": "nix build"
-    },
-    "test": {
-      "systems": ["x86_64-linux", "aarch64-darwin"],
-      "command": "nix run .#test",
-      "depends_on": ["build"]
-    }
-  }
-}
+**`justfile`** (root):
+```just
+mod ci
+```
+
+**`ci.just`**:
+```just
+[metadata("systems", "x86_64-linux", "aarch64-darwin")]
+build:
+    nix build
+
+[metadata("systems", "x86_64-linux", "aarch64-darwin")]
+[metadata("depends_on", "build")]
+test:
+    nix run .#test
 ```
 
 ```bash
-nix run github:srid/localci -- -f localci.json
+nix run github:srid/localci
 ```
 
 This expands into a step×system matrix: `build` and `test` each run on both systems, in parallel. Dependencies resolve per-system — `test` on x86_64-linux waits for `build` on x86_64-linux, not on aarch64-darwin. Each cell in the matrix gets its own GitHub commit status.
 
-Under the hood, localci generates a [process-compose](https://github.com/F1bonacc1/process-compose) config and delegates orchestration to it. Each step is a self-invocation of localci with `--sha` pinning. Pass `--tui` to get the process-compose terminal UI.
+Steps are invoked as `just ci::<recipe>` in the extracted archive. You can also run them manually: `just ci build`, `just ci test`.
+
+### Metadata attributes
+
+- `[metadata("systems", "x86_64-linux", "aarch64-darwin")]` — target Nix systems
+- `[metadata("depends_on", "build")]` — dependency on another CI step
 
 ## GitHub Actions
 
@@ -75,27 +81,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: nixbuild/nix-quick-install-action@v34
-      - run: nix run github:srid/localci -- --sha ${{ github.sha }} -f localci.json
+      - run: nix run github:srid/localci -- --sha ${{ github.sha }}
 ```
 
 Each step posts its own commit status (`localci/build`, `localci/test`), so the PR shows fine-grained check results even though it's a single CI job.
 
 ## Agent integration (MCP)
 
-localci can expose CI steps as [MCP](https://modelcontextprotocol.io/) tools via process-compose's built-in MCP server. Coding agents (Claude Code, etc.) connect over stdio and invoke steps individually.
+localci exposes CI steps as [MCP](https://modelcontextprotocol.io/) tools. Coding agents (Claude Code, etc.) connect and invoke steps individually.
 
 ### Setup
 
 Add two files to your project root:
 
-**`localci.json`** — define your CI steps:
-```json
-{
-  "steps": {
-    "build": { "command": "nix build" },
-    "test": { "command": "nix run .#test", "depends_on": ["build"] }
-  }
-}
+**`ci.just`** — define your CI steps (with `mod ci` in your root justfile):
+```just
+[metadata("depends_on", "build")]
+test:
+    nix run .#test
+build:
+    nix build
 ```
 
 **`.mcp.json`** — register the MCP server (auto-loaded by Claude Code):
@@ -103,9 +108,26 @@ Add two files to your project root:
 {
   "mcpServers": {
     "localci": {
+      "type": "http",
+      "url": "http://localhost:8417/mcp"
+    }
+  }
+}
+```
+
+Start the persistent MCP server:
+```bash
+nix run github:srid/localci -- serve
+```
+
+Or use stdio mode for auto-start:
+```json
+{
+  "mcpServers": {
+    "localci": {
       "type": "stdio",
       "command": "nix",
-      "args": ["run", "github:srid/localci", "--", "--mcp", "-f", "localci.json"]
+      "args": ["run", "github:srid/localci", "--", "--mcp"]
     }
   }
 }
@@ -124,34 +146,31 @@ Use the localci MCP tools (mcp__localci__<step>) — never run build or test com
 4. Once green: push, then run localci MCP tools again to post GitHub statuses
 ```
 
-Each step from `localci.json` appears as an MCP tool (named `mcp__localci__<step>`). Dependencies are respected — invoking a step auto-starts its dependencies first. Steps can be re-invoked after fixing code. Each tool invocation returns the full step output directly.
-
-> [!IMPORTANT]
-> The MCP server reads `localci.json` once at startup. If you change the steps, restart your MCP client (e.g. Claude Code) to pick up the new config. Code changes are always tested fresh — each invocation resolves HEAD at runtime.
+Each CI recipe appears as an MCP tool. A `status-all` tool polls all steps at once. The `localci://graph` resource exposes the dependency graph so agents can parallelize independent steps.
 
 ### Branch protection
 
-Require localci checks to pass before merging PRs. This reads `localci.json`, expands the step×system matrix, and sets the correct status contexts as required checks on the default branch:
+Require localci checks to pass before merging PRs. This reads the justfile ci module, expands the step×system matrix, and sets the correct status contexts as required checks on the default branch:
 
 ```bash
-localci protect -f localci.json
+localci protect
 ```
 
 ## Reference
 
 ```
 localci [run] [options] -- <command...>    Single-step mode
-localci [run] -f <config.json>             Multi-step mode
-localci protect -f <config.json>           Set branch protection
+localci [run] [options]                    Multi-step mode (justfile ci module)
+localci [run] --mcp                        MCP server (stdio)
+localci serve [-p PORT]                    MCP server (HTTP, default :8417)
+localci protect                            Set branch protection
 
 Options:
   -s, --system <system>   Nix system to run on (remote if different from current host)
   -n, --name <name>       GitHub status check name (default: command basename)
-  -f, --file <path>       Multi-step JSON config
   --sha <sha>             Pin to a commit SHA (skips clean-tree check)
-  --tui                   Show process-compose TUI (multi-step only)
-  --mcp                   Expose steps as MCP tools (multi-step only)
+  --mcp                   Start MCP server exposing CI steps as tools
   --no-signoff            Skip GitHub status posting (test before pushing)
 ```
 
-Requires `git`, [`gh`](https://cli.github.com/) (authenticated), and `nix`. Must be run inside a git repository with a GitHub remote.
+Requires `git`, [`gh`](https://cli.github.com/) (authenticated), `nix`, and [`just`](https://github.com/casey/just). Must be run inside a git repository with a GitHub remote.

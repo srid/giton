@@ -1,9 +1,11 @@
+mod ci
+
 default:
     @just --list
 
 # Run local CI (build + test with GitHub status reporting)
 ci:
-    nix run . -- -f localci.json
+    nix run .
 
 # Run integration tests
 test:

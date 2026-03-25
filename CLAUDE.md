@@ -15,7 +15,8 @@ Use the localci MCP tools (`mcp__localci__build`, `mcp__localci__test`) — neve
 
 # Non-obvious patterns
 
+- Multi-step mode reads CI steps from a `ci` just module (`ci.just`). Metadata attributes encode systems and dependencies. `just --dump --dump-format json` extracts the graph.
 - Multi-step mode self-invokes the localci binary for each step with `--sha` and `--workdir` flags. These are internal — `--workdir` skips archive extraction since the parent already extracted once per system.
 - Tests are bash scripts (`test/test_*.sh`) that run the binary externally with a mock `gh` that logs calls to `$GH_CALL_LOG`. The mock must shadow the real `gh` in PATH, which is why tests use the unwrapped binary.
 - `git archive` output is piped directly to `tar` (or `ssh | tar` for remote) — never written to disk.
-- `--mcp` mode generates process-compose config with `mcp_server: {transport: stdio}` and all processes `disabled: true` with `mcp: {type: tool}`. Process-compose stays running as an MCP server; agents invoke steps on demand.
+- `--mcp` mode starts a native MCP server (mark3labs/mcp-go) over stdio. Each step×system is a tool; a `localci://graph` resource exposes the dependency graph so agents can parallelize independent steps. `localci serve` runs the same server over HTTP.

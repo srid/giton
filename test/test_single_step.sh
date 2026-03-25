@@ -1,5 +1,11 @@
 # Single-step mode tests
 
+# Clean up any justfile/ci.just from multi-step tests
+rm -f "$TEST_REPO/justfile" "$TEST_REPO/ci.just"
+git add -A
+git commit -q -m "clean up" --allow-empty
+SHA=$(git rev-parse HEAD)
+
 # Basic command succeeds
 run_localci --sha "$SHA" -n test -- echo hello
 if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "hello"; then
@@ -25,12 +31,12 @@ else
   fail "--name defaults to command basename"
 fi
 
-# Missing command shows error
+# No command + no justfile ci module = error
 run_localci --sha "$SHA"
 if [[ $RC -ne 0 ]]; then
-  pass "missing command exits with error"
+  pass "no command and no justfile ci module exits with error"
 else
-  fail "missing command exits with error"
+  fail "no command and no justfile ci module exits with error"
 fi
 
 # Not in git repo
