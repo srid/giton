@@ -42,9 +42,11 @@ func (jt *jobTracker) start(key, sha string, run func() jobResult) string {
 	if _, ok := jt.running[key]; ok {
 		return "already running"
 	}
-	if _, ok := jt.done[key]; ok {
-		return "already completed"
+	if prev, ok := jt.done[key]; ok && prev.rc == 0 {
+		return "already passed"
 	}
+	// Allow re-running failed steps
+	delete(jt.done, key)
 
 	jt.shas[key] = sha
 	ch := make(chan jobResult, 1)
