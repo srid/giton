@@ -15,7 +15,7 @@
             pname = "localci";
             version = "0.1.0";
             src = ./.;
-            vendorHash = "sha256-6B/Q8Byws0F6zMBbrvPrL7TcjVSAXCXnEIz5ODTmyQ4=";
+            vendorHash = "sha256-My1d3m4SOQk+RMBNAPPbMcjy+mqSYT/vG0FhnJ/hoCU=";
             subPackages = [ "cmd/localci" ];
             meta.description = "Local CI tool — run commands on Nix platforms with GitHub status reporting";
           };
@@ -34,14 +34,14 @@
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.makeWrapper ];
             postInstall = ''
               wrapProgram $out/bin/localci \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.gh pkgs.nix pkgs.openssh pkgs.process-compose ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.gh pkgs.nix pkgs.openssh ]}
             '';
           });
 
           # Test runner (uses unwrapped binary so mock gh takes precedence in PATH)
           packages.test = pkgs.writeShellApplication {
             name = "localci-test";
-            runtimeInputs = [ pkgs.git pkgs.nix pkgs.process-compose ];
+            runtimeInputs = [ pkgs.git pkgs.nix ];
             text = ''
               export LOCALCI="${localci}/bin/localci"
               exec bash ${testFiles}/run.sh "$@"

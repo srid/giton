@@ -1,7 +1,8 @@
 // localci — local CI tool that runs commands on Nix platforms and posts
 // GitHub commit statuses. Two modes: single-step (-- <cmd>) runs one
 // command; multi-step (-f config.json) orchestrates parallel steps via
-// process-compose. When --system differs from the current host, commands
+// a native DAG executor. MCP mode (--mcp) starts an MCP server exposing
+// steps as tools. When --system differs from the current host, commands
 // run on a remote machine over SSH.
 package main
 
@@ -35,6 +36,15 @@ func main() {
 	if !isInGitRepo() {
 		logErr("Not inside a git repository.")
 		os.Exit(1)
+	}
+
+	// MCP mode: start MCP server immediately — SHA is resolved per tool call.
+	if args.mcp {
+		if args.configFile == "" {
+			logErr("--mcp requires -f <config.json>")
+			os.Exit(1)
+		}
+		os.Exit(runMCPServer(args))
 	}
 
 	// --sha pins to an explicit commit and skips the clean-tree check.
@@ -82,7 +92,6 @@ type cliArgs struct {
 	cmd            []string // everything after --
 	shaPin         string
 	configFile     string
-	tui            bool
 	mcp            bool
 	noSignoff      bool
 	workdir        string // pre-extracted dir, set by multi-step self-invocation
@@ -95,14 +104,14 @@ func parseArgs() cliArgs {
 	flag.StringVarP(&a.name, "name", "n", "", "Check name for GitHub status context (default: command name)")
 	flag.StringVar(&a.shaPin, "sha", "", "Pin to a specific commit SHA (skips clean-tree check)")
 	flag.StringVarP(&a.configFile, "file", "f", "", "JSON config file defining steps, systems, and dependencies")
-	flag.BoolVar(&a.tui, "tui", false, "Enable process-compose TUI (multi-step mode only)")
-	flag.BoolVar(&a.mcp, "mcp", false, "Expose steps as MCP tools via process-compose (multi-step mode only)")
+	flag.BoolVar(&a.mcp, "mcp", false, "Start MCP server exposing steps as tools (multi-step mode only)")
 	flag.BoolVar(&a.noSignoff, "no-signoff", false, "Skip GitHub status posting (test locally before pushing)")
 	flag.StringVar(&a.workdir, "workdir", "", "Pre-extracted working directory (internal, used by multi-step mode)")
 
 	flag.Usage = func() {
 		logErr("Usage: localci [run] [options] -- <command...>")
 		logErr("       localci [run] -f <config.json>")
+		logErr("       localci [run] --mcp -f <config.json>")
 		logErr("       localci protect -f <config.json>")
 		logErr("")
 		flag.PrintDefaults()
