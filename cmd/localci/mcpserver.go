@@ -23,23 +23,12 @@ func runMCPServer(args cliArgs) int {
 		return 1
 	}
 
-	currentSystem := getCurrentSystem()
 	cwd, _ := os.Getwd()
 
-	allSystems := collectSystems(config)
-
-	// Resolve remote hosts upfront — tool handlers can't prompt.
-	hostMap := map[string]string{currentSystem: mustHostname()}
-	for _, sys := range allSystems {
-		if sys != currentSystem {
-			host, err := getRemoteHost(sys)
-			if err != nil {
-				logErr("Failed to get host for %s: %v", sys, err)
-				return 1
-			}
-			hostMap[sys] = host
-			exec.Command("ssh", host, "echo", "ok").Run()
-		}
+	// Resolve and warm SSH connections upfront — tool handlers can't prompt.
+	if _, _, err := resolveHosts(config); err != nil {
+		logErr("%v", err)
+		return 1
 	}
 
 	self, err := selfPathResolved()
@@ -61,7 +50,7 @@ func runMCPServer(args cliArgs) int {
 				mcp.Description("Git ref to test (default: HEAD)"),
 			),
 		)
-		s.AddTool(tool, makeStepHandler(p, step, self, cwd, hostMap, args.noSignoff))
+		s.AddTool(tool, makeStepHandler(p, step, self, cwd, args.noSignoff))
 	}
 
 	// Register dependency graph resource
@@ -83,7 +72,6 @@ func runMCPServer(args cliArgs) int {
 func makeStepHandler(
 	p processEntry, step StepConfig,
 	self, cwd string,
-	hostMap map[string]string,
 	noSignoff bool,
 ) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -111,20 +99,23 @@ func makeStepHandler(
 		cmd.Stderr = &buf
 		rc := exitCode(cmd.Run())
 
-		output := buf.String()
-		// Truncate large output
-		lines := strings.Split(output, "\n")
-		const maxLines = 200
-		if len(lines) > maxLines {
-			output = fmt.Sprintf("... (%d lines truncated)\n", len(lines)-maxLines) +
-				strings.Join(lines[len(lines)-maxLines:], "\n")
-		}
+		output := truncateOutput(buf.String(), 200)
 
 		if rc != 0 {
 			return mcp.NewToolResultText(fmt.Sprintf("FAILED (exit %d)\n\n%s", rc, output)), nil
 		}
 		return mcp.NewToolResultText(output), nil
 	}
+}
+
+// truncateOutput keeps the last maxLines of output, prepending a truncation notice.
+func truncateOutput(output string, maxLines int) string {
+	lines := strings.Split(output, "\n")
+	if len(lines) <= maxLines {
+		return output
+	}
+	return fmt.Sprintf("... (%d lines truncated)\n", len(lines)-maxLines) +
+		strings.Join(lines[len(lines)-maxLines:], "\n")
 }
 
 func makeGraphHandler(procs []processEntry, config MultiStepConfig) server.ResourceHandlerFunc {

@@ -51,6 +51,26 @@ type processEntry struct {
 	key  string // "step" or "step (system)"
 }
 
+// resolveHosts resolves and warms SSH connections for all remote systems.
+// Must happen upfront since subprocesses/tool handlers can't prompt.
+func resolveHosts(config MultiStepConfig) (hostMap map[string]string, allSystems []string, err error) {
+	currentSystem := getCurrentSystem()
+	allSystems = collectSystems(config)
+	hostMap = map[string]string{currentSystem: mustHostname()}
+	for _, sys := range allSystems {
+		if sys != currentSystem {
+			host, err := getRemoteHost(sys)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get host for %s: %w", sys, err)
+			}
+			hostMap[sys] = host
+			logMsg("Warming SSH connection to %s (%s)...", cBold(host), sys)
+			exec.Command("ssh", host, "echo", "ok").Run()
+		}
+	}
+	return hostMap, allSystems, nil
+}
+
 // runMultiStep reads a JSON config defining steps (with optional systems and
 // dependencies), resolves remote hosts, extracts the repo to each target,
 // and runs all steps in parallel using a native DAG executor.
@@ -67,22 +87,10 @@ func runMultiStep(args cliArgs, sha string) int {
 	currentSystem := getCurrentSystem()
 	cwd, _ := os.Getwd()
 
-	// Collect all unique systems from config
-	allSystems := collectSystems(config)
-
-	// Resolve remote hosts upfront — subprocesses can't prompt for hostnames.
-	hostMap := map[string]string{currentSystem: mustHostname()}
-	for _, sys := range allSystems {
-		if sys != currentSystem {
-			host, err := getRemoteHost(sys)
-			if err != nil {
-				logErr("Failed to get host for %s: %v", sys, err)
-				return 1
-			}
-			hostMap[sys] = host
-			logMsg("Warming SSH connection to %s (%s)...", cBold(host), sys)
-			exec.Command("ssh", host, "echo", "ok").Run()
-		}
+	hostMap, allSystems, err := resolveHosts(config)
+	if err != nil {
+		logErr("%v", err)
+		return 1
 	}
 
 	// Pre-extract repo once per system for efficiency
@@ -151,8 +159,10 @@ func runMultiStep(args cliArgs, sha string) int {
 	return exitCode
 }
 
+type stepState int
+
 const (
-	stateWaiting = iota
+	stateWaiting stepState = iota
 	stateRunning
 	stateDone
 	stateFailed
@@ -171,7 +181,7 @@ func runDAG(
 	depMap := buildDepMap(procs, config)
 
 	var mu sync.Mutex
-	state := make(map[string]int)
+	state := make(map[string]stepState)
 	for _, p := range procs {
 		state[p.key] = stateWaiting
 	}
@@ -419,6 +429,16 @@ func printStepReport(logDir string) {
 	failFmt := color.New(color.FgRed, color.Bold).SprintfFunc()
 	skipFmt := color.New(color.FgYellow).SprintfFunc()
 
+	statusStr := func(r stepResult) string {
+		if r.failed {
+			return failFmt("FAIL")
+		}
+		if len(r.messages) == 0 {
+			return skipFmt("skip")
+		}
+		return passFmt("pass")
+	}
+
 	hasSystems := false
 	for _, r := range results {
 		if r.system != "" {
@@ -432,26 +452,14 @@ func printStepReport(logDir string) {
 		tbl := table.New("Step", "System", "Status")
 		tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
 		for _, r := range results {
-			status := passFmt("pass")
-			if r.failed {
-				status = failFmt("FAIL")
-			} else if len(r.messages) == 0 {
-				status = skipFmt("skip")
-			}
-			tbl.AddRow(r.step, r.system, status)
+			tbl.AddRow(r.step, r.system, statusStr(r))
 		}
 		tbl.Print()
 	} else {
 		tbl := table.New("Step", "Status")
 		tbl.WithHeaderFormatter(headerFmt).WithWriter(os.Stderr)
 		for _, r := range results {
-			status := passFmt("pass")
-			if r.failed {
-				status = failFmt("FAIL")
-			} else if len(r.messages) == 0 {
-				status = skipFmt("skip")
-			}
-			tbl.AddRow(r.step, status)
+			tbl.AddRow(r.step, statusStr(r))
 		}
 		tbl.Print()
 	}
@@ -484,8 +492,12 @@ func buildDependencyGraph(procs []processEntry, config MultiStepConfig) map[stri
 	depMap := buildDepMap(procs, config)
 	steps := make(map[string]any)
 	for _, p := range procs {
+		deps := depMap[p.key]
+		if deps == nil {
+			deps = []string{}
+		}
 		steps[p.key] = map[string]any{
-			"depends_on": depMap[p.key],
+			"depends_on": deps,
 		}
 	}
 	return map[string]any{
