@@ -95,13 +95,19 @@ type processEntry struct {
 }
 
 // resolveHosts resolves and warms SSH connections for all remote systems.
-func resolveHosts(config MultiStepConfig) (hostMap map[string]string, allSystems []string, err error) {
+// When allowPrompt is false (MCP mode), errors instead of prompting for uncached hosts.
+func resolveHosts(config MultiStepConfig, allowPrompt bool) (hostMap map[string]string, allSystems []string, err error) {
 	currentSystem := getCurrentSystem()
 	allSystems = collectSystems(config)
 	hostMap = map[string]string{currentSystem: mustHostname()}
 	for _, sys := range allSystems {
 		if sys != currentSystem {
-			host, err := getRemoteHost(sys)
+			var host string
+			if allowPrompt {
+				host, err = getRemoteHost(sys)
+			} else {
+				host, err = getRemoteHostCached(sys)
+			}
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get host for %s: %w", sys, err)
 			}
@@ -129,7 +135,7 @@ func runMultiStep(args cliArgs, sha string) int {
 	currentSystem := getCurrentSystem()
 	cwd, _ := os.Getwd()
 
-	hostMap, allSystems, err := resolveHosts(config)
+	hostMap, allSystems, err := resolveHosts(config, true)
 	if err != nil {
 		logErr("%v", err)
 		return 1

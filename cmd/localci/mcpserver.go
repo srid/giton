@@ -24,6 +24,7 @@ type jobResult struct {
 // the agent can fire all tools at once and the tracker handles ordering.
 type jobTracker struct {
 	mu      sync.Mutex
+	queued  map[string]bool         // waiting for deps
 	running map[string]chan jobResult
 	done    map[string]jobResult
 	shas    map[string]string // key → short SHA used
@@ -37,6 +38,7 @@ func newJobTracker(depMap map[string][]string, keys []string) *jobTracker {
 		doneCh[k] = make(chan struct{})
 	}
 	return &jobTracker{
+		queued:  make(map[string]bool),
 		running: make(map[string]chan jobResult),
 		done:    make(map[string]jobResult),
 		shas:    make(map[string]string),
@@ -66,6 +68,10 @@ func (jt *jobTracker) start(key, sha string, run func() jobResult) string {
 	jt.running[key] = ch
 
 	deps := jt.depMap[key]
+	hasDeps := len(deps) > 0
+	if hasDeps {
+		jt.queued[key] = true
+	}
 
 	go func() {
 		// Wait for dependencies to complete successfully
@@ -80,15 +86,20 @@ func (jt *jobTracker) start(key, sha string, run func() jobResult) string {
 			depResult, ok := jt.done[dep]
 			jt.mu.Unlock()
 			if ok && depResult.rc != 0 {
-				// Dependency failed — skip this step
 				ch <- jobResult{output: fmt.Sprintf("skipped: dependency %s failed", dep), rc: 1}
 				return
 			}
 		}
+		// Transition from queued → running
+		if hasDeps {
+			jt.mu.Lock()
+			delete(jt.queued, key)
+			jt.mu.Unlock()
+		}
 		ch <- run()
 	}()
 
-	if len(deps) > 0 {
+	if hasDeps {
 		return fmt.Sprintf("queued (waiting for %s)", strings.Join(deps, ", "))
 	}
 	return "started"
@@ -150,6 +161,9 @@ func (jt *jobTracker) pollAll(keys []string) string {
 			} else {
 				parts = append(parts, fmt.Sprintf("✓ %s", key))
 			}
+		} else if jt.queued[key] {
+			allDone = false
+			parts = append(parts, fmt.Sprintf("◌ %s", key))
 		} else if _, ok := jt.running[key]; ok {
 			allDone = false
 			parts = append(parts, fmt.Sprintf("● %s", key))
@@ -197,7 +211,7 @@ func buildMCPServer() (*server.MCPServer, error) {
 		return nil, err
 	}
 
-	if _, _, err := resolveHosts(config); err != nil {
+	if _, _, err := resolveHosts(config, false); err != nil {
 		return nil, err
 	}
 

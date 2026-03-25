@@ -58,10 +58,23 @@ var validHostname = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 // getRemoteHost looks up or prompts for the SSH hostname for a system.
 func getRemoteHost(system string) (string, error) {
+	return getRemoteHostImpl(system, true)
+}
+
+// getRemoteHostCached returns the cached hostname or errors (no prompting).
+func getRemoteHostCached(system string) (string, error) {
+	return getRemoteHostImpl(system, false)
+}
+
+func getRemoteHostImpl(system string, allowPrompt bool) (string, error) {
 	hosts, _ := loadHosts()
 	if host, ok := hosts[system]; ok && host != "" {
 		logMsg("Using saved host for %s: %s", system, cBold(host))
 		return host, nil
+	}
+
+	if !allowPrompt {
+		return "", fmt.Errorf("no saved host for %s — run 'localci' interactively first to configure it", system)
 	}
 
 	// Prompt for hostname
