@@ -54,11 +54,14 @@ func (jt *jobTracker) start(key, sha string, run func() jobResult) string {
 	if _, ok := jt.running[key]; ok {
 		return "already running"
 	}
-	if prev, ok := jt.done[key]; ok && prev.rc == 0 {
+	// If SHA changed, reset so the step re-runs against the new commit
+	if oldSHA, ok := jt.shas[key]; ok && oldSHA != sha {
+		delete(jt.done, key)
+		jt.doneCh[key] = make(chan struct{})
+	} else if prev, ok := jt.done[key]; ok && prev.rc == 0 {
 		return "already passed"
-	}
-	// Allow re-running failed steps — reset done channel
-	if _, ok := jt.done[key]; ok {
+	} else if _, ok := jt.done[key]; ok {
+		// Allow re-running failed steps
 		delete(jt.done, key)
 		jt.doneCh[key] = make(chan struct{})
 	}
